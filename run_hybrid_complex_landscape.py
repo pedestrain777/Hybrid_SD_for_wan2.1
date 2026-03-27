@@ -33,7 +33,7 @@ MODEL_PATHS = [
     "/data/chenjiayu/models/Wan2.1-T2V-14B-Diffusers",
     "/data/chenjiayu/models/Wan2.1-T2V-1.3B-Diffusers",
 ]
-STEPS = [38, 12]  # 总共 50 步
+STAGE_STEPS = [10, 25, 15]
 
 # 生成参数
 NUM_FRAMES = 81
@@ -48,7 +48,14 @@ class Args:
         self.enable_xformers_memory_efficient_attention = False
         self.use_dpm_solver = True
         self.logger = None
-        self.steps = STEPS
+        self.stage_steps = STAGE_STEPS
+        self.steps = STAGE_STEPS
+        self.hybrid_ema_alpha = 0.7
+        self.hybrid_temporal_top_ratio = 0.30
+        self.hybrid_spatial_top_ratio = 0.20
+        self.hybrid_temporal_dilate = 1
+        self.hybrid_spatial_dilate = 3
+        self.hybrid_relative_diff = True
 
 def main():
     safe_prompt = prompt[:150].replace('/', '_').replace('\\', '_')
@@ -64,7 +71,7 @@ def main():
     print("=" * 60)
     print(f"云侧模型: {MODEL_PATHS[0]}")
     print(f"边缘模型: {MODEL_PATHS[1]}")
-    print(f"步数配置: {STEPS}")
+    print(f"三阶段步数配置: {STAGE_STEPS}")
     print(f"Seed: {SEED}")
     print(f"输出: {output_path}")
     print()

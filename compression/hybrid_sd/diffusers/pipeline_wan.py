@@ -26,6 +26,7 @@ import math
 import time as time_module
 
 import torch
+import torch.nn.functional as F
 from packaging import version
 
 import diffusers
@@ -114,6 +115,18 @@ class HybridWanPipeline(WanPipeline):
         
         # Per-model timing tracking
         self._model_timing_run: Dict[str, float] = {}
+        self.hybrid_mask_config: Dict[str, Any] = {
+            "ema_alpha": 0.7,
+            "temporal_top_ratio": 0.30,
+            "spatial_top_ratio": 0.20,
+            "temporal_dilate": 1,
+            "spatial_dilate": 3,
+            "relative_diff": True,
+        }
+        self._hybrid_state: Dict[str, Any] = {
+            "score_ema": None,
+            "last_mask": None,
+        }
 
     def set_transformers(self, transformers: List):
         """
@@ -146,6 +159,147 @@ class HybridWanPipeline(WanPipeline):
             scheduler_configs: List of scheduler config dictionaries, one for each model
         """
         self.scheduler_configs = scheduler_configs
+
+    def set_hybrid_mask_config(self, hybrid_mask_config: Optional[Dict[str, Any]] = None):
+        if hybrid_mask_config is not None:
+            self.hybrid_mask_config.update(hybrid_mask_config)
+        self._reset_hybrid_state()
+
+    def _reset_hybrid_state(self):
+        self._hybrid_state = {
+            "score_ema": None,
+            "last_mask": None,
+        }
+
+    def _predict_noise_cfg(
+        self,
+        transformer,
+        latent_model_input: torch.Tensor,
+        timestep: torch.Tensor,
+        prompt_embeds: torch.Tensor,
+        negative_prompt_embeds: Optional[torch.Tensor],
+        guidance_scale: float,
+        use_dynamic_cfg: bool,
+        num_inference_steps: int,
+        t,
+        attention_kwargs: Optional[Dict[str, Any]],
+    ):
+        t0 = time_module.perf_counter()
+        noise_cond = transformer(
+            hidden_states=latent_model_input,
+            encoder_hidden_states=prompt_embeds,
+            timestep=timestep,
+            attention_kwargs=attention_kwargs,
+            return_dict=False,
+        )[0]
+        cond_time = time_module.perf_counter() - t0
+
+        uncond_time = 0.0
+        if negative_prompt_embeds is None or guidance_scale <= 1.0:
+            return noise_cond, cond_time, uncond_time
+
+        t1 = time_module.perf_counter()
+        noise_uncond = transformer(
+            hidden_states=latent_model_input,
+            encoder_hidden_states=negative_prompt_embeds,
+            timestep=timestep,
+            attention_kwargs=attention_kwargs,
+            return_dict=False,
+        )[0]
+        uncond_time = time_module.perf_counter() - t1
+
+        cur_guidance = guidance_scale
+        if use_dynamic_cfg:
+            t_scalar = t.item() if torch.is_tensor(t) else float(t)
+            cur_guidance = 1 + guidance_scale * (
+                (1 - math.cos(math.pi * ((num_inference_steps - t_scalar) / num_inference_steps) ** 5.0)) / 2
+            )
+
+        noise_pred = noise_uncond + cur_guidance * (noise_cond - noise_uncond)
+        return noise_pred, cond_time, uncond_time
+
+    def _compute_diff_map(self, latents_before: torch.Tensor, latents_after: torch.Tensor) -> torch.Tensor:
+        diff = (latents_before - latents_after).abs().mean(dim=2)
+        if self.hybrid_mask_config.get("relative_diff", True):
+            denom = latents_before.abs().mean(dim=2).clamp_min(1e-6)
+            diff = diff / denom
+        return diff.float()
+
+    def _topk_binary_mask(self, scores: torch.Tensor, ratio: float) -> torch.Tensor:
+        bsz = scores.shape[0]
+        flat = scores.reshape(bsz, -1)
+        total = flat.shape[1]
+        k = max(1, min(total, int(math.ceil(total * ratio))))
+        topk_vals = torch.topk(flat, k=k, dim=1).values
+        threshold = topk_vals[:, -1].unsqueeze(1)
+        mask = (flat >= threshold).reshape_as(scores)
+        return mask
+
+    def _build_spatiotemporal_mask(self, latents: torch.Tensor) -> torch.Tensor:
+        bsz, t_len, _, h, w = latents.shape
+        score = self._hybrid_state.get("score_ema", None)
+
+        if score is None:
+            full_mask = torch.ones((bsz, t_len, h, w), device=latents.device, dtype=torch.bool)
+            self._hybrid_state["last_mask"] = full_mask
+            return full_mask
+
+        temporal_score = score.mean(dim=(2, 3))
+        temporal_mask = self._topk_binary_mask(
+            temporal_score,
+            ratio=float(self.hybrid_mask_config.get("temporal_top_ratio", 0.30)),
+        )
+
+        dilate_t = int(self.hybrid_mask_config.get("temporal_dilate", 1))
+        if dilate_t > 0:
+            temporal_mask = F.max_pool1d(
+                temporal_mask.float().unsqueeze(1),
+                kernel_size=2 * dilate_t + 1,
+                stride=1,
+                padding=dilate_t,
+            ).squeeze(1) > 0
+
+        temporal_mask_f = temporal_mask.float()[:, :, None, None]
+        active_count = temporal_mask_f.sum(dim=1).clamp_min(1.0)
+        spatial_score = (score * temporal_mask_f).sum(dim=1) / active_count
+
+        spatial_mask = self._topk_binary_mask(
+            spatial_score,
+            ratio=float(self.hybrid_mask_config.get("spatial_top_ratio", 0.20)),
+        )
+
+        dilate_hw = int(self.hybrid_mask_config.get("spatial_dilate", 3))
+        if dilate_hw > 0:
+            spatial_mask = F.max_pool2d(
+                spatial_mask.float().unsqueeze(1),
+                kernel_size=2 * dilate_hw + 1,
+                stride=1,
+                padding=dilate_hw,
+            ).squeeze(1) > 0
+
+        mask_3d = temporal_mask[:, :, None, None] & spatial_mask[:, None, :, :]
+        self._hybrid_state["last_mask"] = mask_3d
+        return mask_3d
+
+    def _fuse_noise_by_mask(
+        self,
+        noise_small: torch.Tensor,
+        noise_large: torch.Tensor,
+        mask_3d: torch.Tensor,
+    ) -> torch.Tensor:
+        mask_5d = mask_3d.unsqueeze(2)
+        return torch.where(mask_5d, noise_large, noise_small)
+
+    def _update_hybrid_score(self, latents_before: torch.Tensor, latents_after: torch.Tensor):
+        new_score = self._compute_diff_map(latents_before, latents_after)
+        prev_score = self._hybrid_state.get("score_ema", None)
+        alpha = float(self.hybrid_mask_config.get("ema_alpha", 0.7))
+        if prev_score is None:
+            score_ema = new_score
+        else:
+            score_ema = alpha * prev_score + (1.0 - alpha) * new_score
+        self._hybrid_state["score_ema"] = score_ema
+        return score_ema
     
     def _get_t5_prompt_embeds(
         self,
@@ -522,6 +676,7 @@ class HybridWanPipeline(WanPipeline):
             latents.dtype,
             tuple(latents.shape),
         )
+        self._reset_hybrid_state()
 
         # 5. Prepare extra step kwargs (not needed for Flow Matching)
         # Flow Matching scheduler doesn't use extra_step_kwargs like DDPM/DDIM
@@ -640,88 +795,122 @@ class HybridWanPipeline(WanPipeline):
                 # Broadcast timestep to batch size (not doubled for CFG)
                 timestep = t.expand(latents.shape[0])
 
-                # Select transformer based on step_config
+                latents_before_step = latents.detach().float()
+                mode = self.step_config["mode"].get(i, "large")
                 model_index = self.step_config["step"][i]
-                model_name = self.step_config["name"][model_index]
-                selected_transformer = self.transformers[model_index]
-                image_rotary_emb = image_rotary_embs[model_index]
-                
-                # Check if model switched - if so, update scheduler config and reset old_pred_original_sample
+                large_index = self.step_config.get("large_index", 0)
+                small_index = self.step_config.get("small_index", 1)
+
+                if mode == "large":
+                    model_name = self.step_config["name"][large_index]
+                elif mode == "small":
+                    model_name = self.step_config["name"][small_index]
+                else:
+                    model_name = f"HYBRID[{self.step_config['name'][large_index]} + {self.step_config['name'][small_index]}]"
+
                 if i > 0:
                     prev_model_index = self.step_config["step"][i - 1]
                     if prev_model_index != model_index:
-                        logger.info(f"=== MODEL SWITCH at step {i}: {self.step_config['name'][prev_model_index]} -> {model_name} ===")
-                        logger.info(f"Scheduler type: {type(self.scheduler).__name__}, is FlowMatchEulerDiscreteScheduler: {isinstance(self.scheduler, FlowMatchEulerDiscreteScheduler)}")
-                        
-                        # Update scheduler config if different models have different configs
+                        logger.info(
+                            f"=== MODEL SWITCH at step {i}: "
+                            f"{self.step_config['name'][prev_model_index]} -> {self.step_config['name'][model_index]} ==="
+                        )
                         if self.scheduler_configs is not None and model_index < len(self.scheduler_configs):
                             new_scheduler_config = self.scheduler_configs[model_index]
                             current_config = self.scheduler.config
-                            
-                            # Check if snr_shift_scale needs to be updated (key difference between 5B and 2B)
+
                             if "snr_shift_scale" in new_scheduler_config:
                                 new_snr_shift_scale = new_scheduler_config["snr_shift_scale"]
                                 current_snr_shift_scale = getattr(current_config, "snr_shift_scale", None)
-                                
+
                                 if new_snr_shift_scale != current_snr_shift_scale:
-                                    logger.info(f"Updating scheduler snr_shift_scale: {current_snr_shift_scale} -> {new_snr_shift_scale}")
-                                    # Update scheduler config
-                                    self.scheduler.config.snr_shift_scale = new_snr_shift_scale
-                                    # Re-initialize scheduler to apply the change
-                                    # For FlowMatchEulerDiscreteScheduler, we need to update the internal state
+                                    logger.info(
+                                        f"Updating scheduler snr_shift_scale: "
+                                        f"{current_snr_shift_scale} -> {new_snr_shift_scale}"
+                                    )
                                     if isinstance(self.scheduler, FlowMatchEulerDiscreteScheduler):
-                                        # Create new scheduler with updated config
                                         updated_config = self.scheduler.config.copy()
                                         updated_config["snr_shift_scale"] = new_snr_shift_scale
                                         self.scheduler = FlowMatchEulerDiscreteScheduler.from_config(updated_config)
-                                        # Restore timesteps using the existing timesteps variable
-                                        # timesteps and num_inference_steps are already set before the denoising loop
                                         self.scheduler.set_timesteps(num_inference_steps, device=latents.device)
-                                        logger.info(f"Scheduler updated with snr_shift_scale={new_snr_shift_scale}, timesteps restored (num_inference_steps={num_inference_steps})")
+                                        logger.info(
+                                            f"Scheduler updated with snr_shift_scale={new_snr_shift_scale}, "
+                                            f"timesteps restored (num_inference_steps={num_inference_steps})"
+                                        )
 
                         if isinstance(self.scheduler, FlowMatchEulerDiscreteScheduler):
-                            logger.info(f"Resetting old_pred_original_sample (was: {old_pred_original_sample is not None})")
                             old_pred_original_sample = None
-                        else:
-                            logger.info(f"Scheduler is {type(self.scheduler).__name__}, no old_pred_original_sample to reset")
-                
-                logger.info(f"Step {i}/{num_inference_steps}: Using {model_name} (index {model_index})")
-                
-                # Debug: Log shapes (first step only)
-                if i == 0:
-                    logger.debug(f"latent_model_input shape: {latent_model_input.shape}")
-                    logger.debug(f"prompt_embeds shape: {prompt_embeds.shape}")
-                    logger.debug(f"timestep shape: {timestep.shape}")
-                
-                # Check latents for NaN/Inf before transformer prediction
+
+                logger.info(f"Step {i}/{num_inference_steps}: mode={mode}, model={model_name}")
                 if torch.isnan(latent_model_input).any() or torch.isinf(latent_model_input).any():
                     logger.error(f"Step {i}/{num_inference_steps}: latent_model_input contains NaN/Inf before transformer!")
-                    logger.error(f"latent_model_input - min: {latent_model_input.min().item():.6f}, max: {latent_model_input.max().item():.6f}, mean: {latent_model_input.mean().item():.6f}")
                     raise ValueError(f"NaN/Inf detected in latent_model_input at step {i}")
-                
-                # Predict noise with selected transformer
-                # Wan uses two-pass CFG: separate forward passes for cond and uncond
-                
-                # Start timing for model inference (conditional pass)
-                t_model_start = time_module.perf_counter()
-                
-                noise_pred = selected_transformer(
-                    hidden_states=latent_model_input,
-                    encoder_hidden_states=prompt_embeds,
-                    timestep=timestep,
-                    attention_kwargs=attention_kwargs,
-                    return_dict=False,
-                )[0]
-                
-                # End timing for conditional pass
-                model_time_cond = time_module.perf_counter() - t_model_start
-                self._model_timing_run[model_name] = self._model_timing_run.get(model_name, 0.0) + model_time_cond
-                
-                # Initialize CFG time
-                model_time_cfg = 0.0
 
+                if mode == "large":
+                    selected_transformer = self.transformers[large_index]
+                    noise_pred, model_time_cond, model_time_cfg = self._predict_noise_cfg(
+                        transformer=selected_transformer,
+                        latent_model_input=latent_model_input,
+                        timestep=timestep,
+                        prompt_embeds=prompt_embeds,
+                        negative_prompt_embeds=negative_prompt_embeds if do_classifier_free_guidance else None,
+                        guidance_scale=guidance_scale,
+                        use_dynamic_cfg=use_dynamic_cfg,
+                        num_inference_steps=num_inference_steps,
+                        t=t,
+                        attention_kwargs=attention_kwargs,
+                    )
+                elif mode == "small":
+                    selected_transformer = self.transformers[small_index]
+                    noise_pred, model_time_cond, model_time_cfg = self._predict_noise_cfg(
+                        transformer=selected_transformer,
+                        latent_model_input=latent_model_input,
+                        timestep=timestep,
+                        prompt_embeds=prompt_embeds,
+                        negative_prompt_embeds=negative_prompt_embeds if do_classifier_free_guidance else None,
+                        guidance_scale=guidance_scale,
+                        use_dynamic_cfg=use_dynamic_cfg,
+                        num_inference_steps=num_inference_steps,
+                        t=t,
+                        attention_kwargs=attention_kwargs,
+                    )
+                elif mode == "hybrid":
+                    noise_small, small_time_cond, small_time_cfg = self._predict_noise_cfg(
+                        transformer=self.transformers[small_index],
+                        latent_model_input=latent_model_input,
+                        timestep=timestep,
+                        prompt_embeds=prompt_embeds,
+                        negative_prompt_embeds=negative_prompt_embeds if do_classifier_free_guidance else None,
+                        guidance_scale=guidance_scale,
+                        use_dynamic_cfg=use_dynamic_cfg,
+                        num_inference_steps=num_inference_steps,
+                        t=t,
+                        attention_kwargs=attention_kwargs,
+                    )
+                    noise_large, large_time_cond, large_time_cfg = self._predict_noise_cfg(
+                        transformer=self.transformers[large_index],
+                        latent_model_input=latent_model_input,
+                        timestep=timestep,
+                        prompt_embeds=prompt_embeds,
+                        negative_prompt_embeds=negative_prompt_embeds if do_classifier_free_guidance else None,
+                        guidance_scale=guidance_scale,
+                        use_dynamic_cfg=use_dynamic_cfg,
+                        num_inference_steps=num_inference_steps,
+                        t=t,
+                        attention_kwargs=attention_kwargs,
+                    )
+                    mask_3d = self._build_spatiotemporal_mask(latents)
+                    mask_ratio = mask_3d.float().mean().item()
+                    logger.info(f"Step {i}/{num_inference_steps}: hybrid mask ratio = {mask_ratio:.4f}")
+                    noise_pred = self._fuse_noise_by_mask(noise_small, noise_large, mask_3d)
+                    model_time_cond = small_time_cond + large_time_cond
+                    model_time_cfg = small_time_cfg + large_time_cfg
+                else:
+                    raise ValueError(f"Unknown mode: {mode}")
+
+                self._model_timing_run[model_name] = self._model_timing_run.get(model_name, 0.0) + model_time_cond + model_time_cfg
                 logger.info(
-                    "Step %d/%d: noise_pred (cond) - min: %.4f, max: %.4f, mean: %.4f, std: %.4f",
+                    "Step %d/%d: fused noise_pred - min: %.4f, max: %.4f, mean: %.4f, std: %.4f",
                     i,
                     num_inference_steps,
                     noise_pred.min().item(),
@@ -729,60 +918,9 @@ class HybridWanPipeline(WanPipeline):
                     noise_pred.mean().item(),
                     noise_pred.std().item(),
                 )
-
-                # Check noise_pred for NaN/Inf immediately after transformer
                 if torch.isnan(noise_pred).any() or torch.isinf(noise_pred).any():
-                    logger.error(f"Step {i}/{num_inference_steps}: noise_pred contains NaN/Inf after transformer!")
-                    logger.error(f"noise_pred - min: {noise_pred.min().item():.6f}, max: {noise_pred.max().item():.6f}, mean: {noise_pred.mean().item():.6f}")
+                    logger.error(f"Step {i}/{num_inference_steps}: noise_pred contains NaN/Inf!")
                     raise ValueError(f"NaN/Inf detected in noise_pred at step {i}")
-
-                # Perform guidance with second pass for unconditional
-                if do_classifier_free_guidance:
-                    # Start timing for unconditional pass (CFG)
-                    t_model_start2 = time_module.perf_counter()
-                    
-                    noise_uncond = selected_transformer(
-                        hidden_states=latent_model_input,
-                        encoder_hidden_states=negative_prompt_embeds,
-                        timestep=timestep,
-                        attention_kwargs=attention_kwargs,
-                        return_dict=False,
-                    )[0]
-                    
-                    # End timing for CFG pass
-                    model_time_cfg = time_module.perf_counter() - t_model_start2
-                    self._model_timing_run[model_name] = self._model_timing_run.get(model_name, 0.0) + model_time_cfg
-
-                    # Apply dynamic CFG if enabled
-                    if use_dynamic_cfg:
-                        self._guidance_scale = 1 + guidance_scale * (
-                            (
-                                1
-                                - math.cos(
-                                    math.pi
-                                    * ((num_inference_steps - t.item()) / num_inference_steps) ** 5.0
-                                )
-                            )
-                            / 2
-                        )
-
-                    # Combine conditional and unconditional predictions
-                    noise_pred = noise_uncond + self._guidance_scale * (noise_pred - noise_uncond)
-                    logger.info(
-                        "Step %d/%d: noise_pred guided - min: %.4f, max: %.4f, mean: %.4f, std: %.4f",
-                        i,
-                        num_inference_steps,
-                        noise_pred.min().item(),
-                        noise_pred.max().item(),
-                        noise_pred.mean().item(),
-                        noise_pred.std().item(),
-                    )
-                    
-                    # Check noise_pred after guidance
-                    if torch.isnan(noise_pred).any() or torch.isinf(noise_pred).any():
-                        logger.error(f"Step {i}/{num_inference_steps}: noise_pred contains NaN/Inf after guidance!")
-                        logger.error(f"guidance_scale: {self._guidance_scale}, noise_pred - min: {noise_pred.min().item():.6f}, max: {noise_pred.max().item():.6f}")
-                        raise ValueError(f"NaN/Inf detected in noise_pred after guidance at step {i}")
 
                 # Compute previous noisy sample
                 # Wan uses FlowMatchEulerDiscreteScheduler (Flow Matching)
@@ -837,6 +975,10 @@ class HybridWanPipeline(WanPipeline):
                     logger.error(f"noise_pred - min: {noise_pred.min().item():.6f}, max: {noise_pred.max().item():.6f}")
                     logger.error(f"t: {t}")
                     raise ValueError(f"NaN/Inf detected in latents after scheduler.step at step {i}")
+                self._update_hybrid_score(
+                    latents_before=latents_before_step,
+                    latents_after=latents.detach().float(),
+                )
                 
                 # Convert latents back to prompt_embeds dtype (same as parent class)
                 latents = latents.to(prompt_embeds.dtype)

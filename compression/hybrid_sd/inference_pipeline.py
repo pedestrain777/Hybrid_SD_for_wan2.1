@@ -833,6 +833,14 @@ class HybridVideoInferencePipeline:
         print(f'total_step={total_step}, step_config={step_config}')
         self.pipe.set_step_config(step_config)
         self.total_step = total_step
+        self.pipe.set_hybrid_mask_config({
+            "ema_alpha": getattr(self.args, "hybrid_ema_alpha", 0.7),
+            "temporal_top_ratio": getattr(self.args, "hybrid_temporal_top_ratio", 0.30),
+            "spatial_top_ratio": getattr(self.args, "hybrid_spatial_top_ratio", 0.20),
+            "temporal_dilate": getattr(self.args, "hybrid_temporal_dilate", 1),
+            "spatial_dilate": getattr(self.args, "hybrid_spatial_dilate", 3),
+            "relative_diff": getattr(self.args, "hybrid_relative_diff", True),
+        })
         
         # 9. Set generator
         self.generator = torch.Generator(device=self.device).manual_seed(self.seed)
@@ -854,33 +862,61 @@ class HybridVideoInferencePipeline:
     
     def get_step_config(self, args):
         """
-        Generate step configuration for model switching.
-        
-        Args:
-            args: Arguments object with steps attribute (list of step counts per model)
-        
-        Returns:
-            total_step: Total number of inference steps
-            step_config: Dictionary mapping step indices to model indices
+        三阶段配置：
+        - large:  只用大模型
+        - hybrid: 小模型 full + 大模型 full + mask 融合
+        - small:  只用小模型
+
+        返回:
+            total_step
+            step_config = {
+                "step": {step_idx: primary_model_index},   # hybrid阶段也用large作为primary
+                "mode": {step_idx: "large"/"hybrid"/"small"},
+                "name": {0: large_name, 1: small_name},
+                "large_index": 0,
+                "small_index": 1,
+            }
         """
-        assert len(args.steps) > 0, "steps must be non-empty"
-        assert len(self.weight_folders) == len(args.steps), \
-            f"Number of weight folders ({len(self.weight_folders)}) must match number of step configs ({len(args.steps)})"
-        
+        assert len(self.weight_folders) == 2, "当前实现只支持两个模型：[large, small]"
+
+        if hasattr(args, "stage_steps") and args.stage_steps is not None:
+            stage_steps = args.stage_steps
+        else:
+            stage_steps = args.steps
+
+        assert len(stage_steps) == 3, \
+            f"现在必须传 3 段 steps，例如 [10,25,15]，当前得到: {stage_steps}"
+
+        large_steps, hybrid_steps, small_steps = stage_steps
+
         step_config = {
             "step": {},
-            "name": {}
+            "mode": {},
+            "name": {},
+            "large_index": 0,
+            "small_index": 1,
         }
-        
+
         total_step = 0
-        for index, model_step in enumerate(args.steps):
-            for i in range(model_step):
-                step_config["step"][total_step] = index
-                total_step += 1
-        
+
+        for _ in range(large_steps):
+            step_config["step"][total_step] = 0
+            step_config["mode"][total_step] = "large"
+            total_step += 1
+
+        for _ in range(hybrid_steps):
+            step_config["step"][total_step] = 0
+            step_config["mode"][total_step] = "hybrid"
+            total_step += 1
+
+        for _ in range(small_steps):
+            step_config["step"][total_step] = 1
+            step_config["mode"][total_step] = "small"
+            total_step += 1
+
         for index, model_name in enumerate(self.weight_folders):
             step_config["name"][index] = model_name.split("/")[-1]
-        
+
         return total_step, step_config
     
     def generate(
