@@ -1,0 +1,55 @@
+# =========================
+# Python / system artifacts
+# =========================
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+*.log
+
+# =========================
+# Runtime outputs / caches
+# =========================
+logs/
+results/
+outputs/
+tmp/
+temp/
+cache/
+wandb/
+
+# =========================
+# Local environments
+# =========================
+.venv/
+venv/
+env/
+.env
+.DS_Store
+
+# =========================
+# Ignore VBench evaluation stack
+# Keep repo focused on HybridSD Wan collaborative generation
+# =========================
+VBench-master/
+tools/vbench/
+scripts/vbench/
+scripts/run_vbench*.sh
+run_vbench*.sh
+run_*vbench*.py
+*vbench*.py
+*vbench*.md
+VBENCH*.md
+configs/vbench*.yaml
+configs/*vbench*.yml
+configs/*vbench*.yaml
+
+# VBench/eval typical artifacts
+**/metrics/
+**/eval*/
+**/*_eval*/
