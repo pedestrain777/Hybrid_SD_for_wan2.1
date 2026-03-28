@@ -7,15 +7,17 @@ Hybrid SD Wan2.1 14B+1.3B - Complex Landscape 生成
 import os
 import sys
 import time
+from pathlib import Path
 
 gpu_id = sys.argv[1] if len(sys.argv) > 1 else "0"
 prompt_idx = int(sys.argv[2]) if len(sys.argv) > 2 else 0
 
 os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
 
-sys.path.insert(0, "/data/chenjiayu/minyu_lee/Hybrid-sd_wan")
+# 本仓库根目录，确保加载本地的 compression/hybrid_sd（不要使用其它路径下的旧副本）
+_REPO_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(_REPO_ROOT))
 
-from pathlib import Path
 from compression.hybrid_sd.inference_pipeline import HybridVideoInferencePipeline
 
 # 加载 prompts

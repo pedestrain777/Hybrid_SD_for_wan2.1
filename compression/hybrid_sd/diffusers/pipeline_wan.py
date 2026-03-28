@@ -219,9 +219,13 @@ class HybridWanPipeline(WanPipeline):
         return noise_pred, cond_time, uncond_time
 
     def _compute_diff_map(self, latents_before: torch.Tensor, latents_after: torch.Tensor) -> torch.Tensor:
-        diff = (latents_before - latents_after).abs().mean(dim=2)
+        """
+        Wan latents / noise layout: [B, C, T, H, W]
+        return diff_map: [B, T, H, W] (mean over channel dim)
+        """
+        diff = (latents_before - latents_after).abs().mean(dim=1)
         if self.hybrid_mask_config.get("relative_diff", True):
-            denom = latents_before.abs().mean(dim=2).clamp_min(1e-6)
+            denom = latents_before.abs().mean(dim=1).clamp_min(1e-6)
             diff = diff / denom
         return diff.float()
 
@@ -236,7 +240,12 @@ class HybridWanPipeline(WanPipeline):
         return mask
 
     def _build_spatiotemporal_mask(self, latents: torch.Tensor) -> torch.Tensor:
-        bsz, t_len, _, h, w = latents.shape
+        """
+        latents: [B, C, T, H, W]
+        score_ema: [B, T, H, W]
+        return: mask_3d [B, T, H, W]
+        """
+        bsz, _, t_len, h, w = latents.shape
         score = self._hybrid_state.get("score_ema", None)
 
         if score is None:
@@ -287,7 +296,11 @@ class HybridWanPipeline(WanPipeline):
         noise_large: torch.Tensor,
         mask_3d: torch.Tensor,
     ) -> torch.Tensor:
-        mask_5d = mask_3d.unsqueeze(2)
+        """
+        noise_*: [B, C, T, H, W]
+        mask_3d: [B, T, H, W] -> broadcast to [B, 1, T, H, W]
+        """
+        mask_5d = mask_3d.unsqueeze(1)
         return torch.where(mask_5d, noise_large, noise_small)
 
     def _update_hybrid_score(self, latents_before: torch.Tensor, latents_after: torch.Tensor):
@@ -683,22 +696,15 @@ class HybridWanPipeline(WanPipeline):
         # We pass s_churn and s_noise directly in scheduler.step()
 
         # 6. Prepare rotary embeddings for each transformer
-        # This is critical: 5B uses rotary embeddings, 2B doesn't
-        # NOTE: We must use the ACTUAL latent dimensions after VAE encoding,
-        # not the input video dimensions. The latents are already temporal-compressed.
-        # Use latents.size(1) for the actual number of frames in latent space.
+        # Wan latents layout: [B, C, T, H, W] — use dim 2 for temporal length after prepare_latents.
         image_rotary_embs = []
         if self.transformers and len(self.transformers) > 0:
-            # Get actual latent dimensions from latents tensor
-            # latents shape: (B, T_latent, C, H_latent, W_latent)
-            actual_latent_frames = latents.size(1)  # Actual frames after temporal compression
-            actual_latent_height = latents.size(3)  # Actual height in latent space
-            actual_latent_width = latents.size(4)   # Actual width in latent space
-            
+            actual_latent_frames = latents.size(2)
+            actual_latent_height = latents.size(3)
+            actual_latent_width = latents.size(4)
+
             for transformer in self.transformers:
                 if transformer.config.get("use_rotary_positional_embeddings", False):
-                    # Use ACTUAL latent dimensions from the latents tensor
-                    # This matches what the parent class does: latents.size(1)
                     image_rotary_emb = super()._prepare_rotary_positional_embeddings(
                         height=height,  # Use output height for grid calculation
                         width=width,    # Use output width for grid calculation
@@ -714,7 +720,7 @@ class HybridWanPipeline(WanPipeline):
                 if self.transformer.config.get("use_rotary_positional_embeddings", False):
                     # Use actual latent frames if latents are available
                     if latents is not None:
-                        actual_latent_frames = latents.size(1)
+                        actual_latent_frames = latents.size(2)
                     else:
                         actual_latent_frames = num_frames
                     image_rotary_embs.append(super()._prepare_rotary_positional_embeddings(
@@ -1057,7 +1063,7 @@ class HybridWanPipeline(WanPipeline):
             video = latents
         else:
             if additional_frames > 0:
-                latents = latents[:, additional_frames:]
+                latents = latents[:, :, additional_frames:, :, :]
             # Check latents for NaN or Inf values before decoding
             if torch.isnan(latents).any() or torch.isinf(latents).any():
                 logger.error("Latents contain NaN or Inf values before VAE decoding! This should not happen.")
