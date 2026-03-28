@@ -833,13 +833,27 @@ class HybridVideoInferencePipeline:
         print(f'total_step={total_step}, step_config={step_config}')
         self.pipe.set_step_config(step_config)
         self.total_step = total_step
-        self.pipe.set_hybrid_mask_config({
-            "ema_alpha": getattr(self.args, "hybrid_ema_alpha", 0.7),
-            "temporal_top_ratio": getattr(self.args, "hybrid_temporal_top_ratio", 0.30),
-            "spatial_top_ratio": getattr(self.args, "hybrid_spatial_top_ratio", 0.20),
-            "temporal_dilate": getattr(self.args, "hybrid_temporal_dilate", 1),
-            "spatial_dilate": getattr(self.args, "hybrid_spatial_dilate", 3),
+        self.pipe.set_hybrid_roi_config({
+            "ema_alpha": getattr(self.args, "hybrid_ema_alpha", 0.85),
             "relative_diff": getattr(self.args, "hybrid_relative_diff", True),
+            "temporal_top_ratio": getattr(self.args, "hybrid_temporal_top_ratio", 0.15),
+            "temporal_dilate": getattr(self.args, "hybrid_temporal_dilate", 1),
+            "max_segments": getattr(self.args, "hybrid_max_segments", 2),
+            "spatial_top_ratio": getattr(self.args, "hybrid_spatial_top_ratio", 0.08),
+            "spatial_dilate": getattr(self.args, "hybrid_spatial_dilate", 1),
+            "margin_t": getattr(self.args, "hybrid_margin_t", 1),
+            "margin_h": getattr(self.args, "hybrid_margin_h", 4),
+            "margin_w": getattr(self.args, "hybrid_margin_w", 4),
+            "min_crop_t": getattr(self.args, "hybrid_min_crop_t", 1),
+            "min_crop_h": getattr(self.args, "hybrid_min_crop_h", 8),
+            "min_crop_w": getattr(self.args, "hybrid_min_crop_w", 8),
+            "align_h": getattr(self.args, "hybrid_align_h", 2),
+            "align_w": getattr(self.args, "hybrid_align_w", 2),
+            "smooth_iou_thresh": getattr(self.args, "hybrid_smooth_iou_thresh", 0.25),
+            "smooth_momentum": getattr(self.args, "hybrid_smooth_momentum", 0.6),
+            "debug_every": getattr(self.args, "hybrid_debug_every", 1),
+            "debug_topk_frames": getattr(self.args, "hybrid_debug_topk_frames", 5),
+            "save_debug_dir": getattr(self.args, "hybrid_debug_save_dir", None),
         })
         
         # 9. Set generator
@@ -864,7 +878,7 @@ class HybridVideoInferencePipeline:
         """
         三阶段配置：
         - large:  只用大模型
-        - hybrid: 小模型 full + 大模型 full + mask 融合
+        - hybrid: 小模型 full + router ROI + 大模型仅跑 crop 并回填 core
         - small:  只用小模型
 
         返回:

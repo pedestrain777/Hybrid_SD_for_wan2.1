@@ -26,12 +26,14 @@ import math
 import time as time_module
 
 import torch
-import torch.nn.functional as F
 from packaging import version
 
 import diffusers
 from diffusers import WanPipeline
 from diffusers.utils import logging
+
+from compression.hybrid_sd.routers.video_mask_router import VideoMaskRouter
+
 # Wan does not need retrieve_timesteps, uses scheduler's built-in method
 
 # Try to import Wan-specific models
@@ -115,18 +117,31 @@ class HybridWanPipeline(WanPipeline):
         
         # Per-model timing tracking
         self._model_timing_run: Dict[str, float] = {}
-        self.hybrid_mask_config: Dict[str, Any] = {
-            "ema_alpha": 0.7,
-            "temporal_top_ratio": 0.30,
-            "spatial_top_ratio": 0.20,
-            "temporal_dilate": 1,
-            "spatial_dilate": 3,
+
+        # 思路二：hybrid 阶段 = FullSmall + Large ROI crop refine
+        self.hybrid_roi_config: Dict[str, Any] = {
+            "ema_alpha": 0.85,
             "relative_diff": True,
+            "temporal_top_ratio": 0.15,
+            "temporal_dilate": 1,
+            "max_segments": 2,
+            "spatial_top_ratio": 0.08,
+            "spatial_dilate": 1,
+            "margin_t": 1,
+            "margin_h": 4,
+            "margin_w": 4,
+            "min_crop_t": 1,
+            "min_crop_h": 8,
+            "min_crop_w": 8,
+            "align_h": 2,
+            "align_w": 2,
+            "smooth_iou_thresh": 0.25,
+            "smooth_momentum": 0.6,
+            "debug_every": 1,
+            "debug_topk_frames": 5,
+            "save_debug_dir": None,
         }
-        self._hybrid_state: Dict[str, Any] = {
-            "score_ema": None,
-            "last_mask": None,
-        }
+        self.roi_router: VideoMaskRouter = VideoMaskRouter(self.hybrid_roi_config)
 
     def set_transformers(self, transformers: List):
         """
@@ -160,16 +175,19 @@ class HybridWanPipeline(WanPipeline):
         """
         self.scheduler_configs = scheduler_configs
 
+    def set_hybrid_roi_config(self, hybrid_roi_config: Optional[Dict[str, Any]] = None):
+        if hybrid_roi_config is not None:
+            self.hybrid_roi_config.update(hybrid_roi_config)
+        self.roi_router.update_config(self.hybrid_roi_config)
+        self.roi_router.reset()
+
     def set_hybrid_mask_config(self, hybrid_mask_config: Optional[Dict[str, Any]] = None):
-        if hybrid_mask_config is not None:
-            self.hybrid_mask_config.update(hybrid_mask_config)
-        self._reset_hybrid_state()
+        """兼容旧接口名，等同于 set_hybrid_roi_config。"""
+        self.set_hybrid_roi_config(hybrid_mask_config)
 
     def _reset_hybrid_state(self):
-        self._hybrid_state = {
-            "score_ema": None,
-            "last_mask": None,
-        }
+        if hasattr(self, "roi_router") and self.roi_router is not None:
+            self.roi_router.reset()
 
     def _predict_noise_cfg(
         self,
@@ -218,102 +236,159 @@ class HybridWanPipeline(WanPipeline):
         noise_pred = noise_uncond + cur_guidance * (noise_cond - noise_uncond)
         return noise_pred, cond_time, uncond_time
 
-    def _compute_diff_map(self, latents_before: torch.Tensor, latents_after: torch.Tensor) -> torch.Tensor:
-        """
-        Wan latents / noise layout: [B, C, T, H, W]
-        return diff_map: [B, T, H, W] (mean over channel dim)
-        """
-        diff = (latents_before - latents_after).abs().mean(dim=1)
-        if self.hybrid_mask_config.get("relative_diff", True):
-            denom = latents_before.abs().mean(dim=1).clamp_min(1e-6)
-            diff = diff / denom
-        return diff.float()
-
-    def _topk_binary_mask(self, scores: torch.Tensor, ratio: float) -> torch.Tensor:
-        bsz = scores.shape[0]
-        flat = scores.reshape(bsz, -1)
-        total = flat.shape[1]
-        k = max(1, min(total, int(math.ceil(total * ratio))))
-        topk_vals = torch.topk(flat, k=k, dim=1).values
-        threshold = topk_vals[:, -1].unsqueeze(1)
-        mask = (flat >= threshold).reshape_as(scores)
-        return mask
-
-    def _build_spatiotemporal_mask(self, latents: torch.Tensor) -> torch.Tensor:
-        """
-        latents: [B, C, T, H, W]
-        score_ema: [B, T, H, W]
-        return: mask_3d [B, T, H, W]
-        """
-        bsz, _, t_len, h, w = latents.shape
-        score = self._hybrid_state.get("score_ema", None)
-
-        if score is None:
-            full_mask = torch.ones((bsz, t_len, h, w), device=latents.device, dtype=torch.bool)
-            self._hybrid_state["last_mask"] = full_mask
-            return full_mask
-
-        temporal_score = score.mean(dim=(2, 3))
-        temporal_mask = self._topk_binary_mask(
-            temporal_score,
-            ratio=float(self.hybrid_mask_config.get("temporal_top_ratio", 0.30)),
-        )
-
-        dilate_t = int(self.hybrid_mask_config.get("temporal_dilate", 1))
-        if dilate_t > 0:
-            temporal_mask = F.max_pool1d(
-                temporal_mask.float().unsqueeze(1),
-                kernel_size=2 * dilate_t + 1,
-                stride=1,
-                padding=dilate_t,
-            ).squeeze(1) > 0
-
-        temporal_mask_f = temporal_mask.float()[:, :, None, None]
-        active_count = temporal_mask_f.sum(dim=1).clamp_min(1.0)
-        spatial_score = (score * temporal_mask_f).sum(dim=1) / active_count
-
-        spatial_mask = self._topk_binary_mask(
-            spatial_score,
-            ratio=float(self.hybrid_mask_config.get("spatial_top_ratio", 0.20)),
-        )
-
-        dilate_hw = int(self.hybrid_mask_config.get("spatial_dilate", 3))
-        if dilate_hw > 0:
-            spatial_mask = F.max_pool2d(
-                spatial_mask.float().unsqueeze(1),
-                kernel_size=2 * dilate_hw + 1,
-                stride=1,
-                padding=dilate_hw,
-            ).squeeze(1) > 0
-
-        mask_3d = temporal_mask[:, :, None, None] & spatial_mask[:, None, :, :]
-        self._hybrid_state["last_mask"] = mask_3d
-        return mask_3d
-
-    def _fuse_noise_by_mask(
+    def _update_hybrid_score(
         self,
-        noise_small: torch.Tensor,
-        noise_large: torch.Tensor,
-        mask_3d: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        noise_*: [B, C, T, H, W]
-        mask_3d: [B, T, H, W] -> broadcast to [B, 1, T, H, W]
-        """
-        mask_5d = mask_3d.unsqueeze(1)
-        return torch.where(mask_5d, noise_large, noise_small)
+        latents_before: torch.Tensor,
+        latents_after: torch.Tensor,
+        step_idx: Optional[int] = None,
+    ):
+        if self.roi_router is None:
+            return None
+        return self.roi_router.observe(
+            latents_before, latents_after, step_idx if step_idx is not None else -1
+        )
 
-    def _update_hybrid_score(self, latents_before: torch.Tensor, latents_after: torch.Tensor):
-        new_score = self._compute_diff_map(latents_before, latents_after)
-        prev_score = self._hybrid_state.get("score_ema", None)
-        alpha = float(self.hybrid_mask_config.get("ema_alpha", 0.7))
-        if prev_score is None:
-            score_ema = new_score
-        else:
-            score_ema = alpha * prev_score + (1.0 - alpha) * new_score
-        self._hybrid_state["score_ema"] = score_ema
-        return score_ema
-    
+    def _log_router_debug(self, step_idx: int, debug_info: Optional[Dict[str, Any]]):
+        if debug_info is None:
+            return
+
+        rois = debug_info.get("rois", [])
+        print("\n" + "=" * 100)
+        print(f"[Hybrid ROI Router] step={step_idx}")
+        if "score_mean" in debug_info:
+            print(
+                f"score_mean={debug_info['score_mean']:.6f}, "
+                f"score_std={debug_info['score_std']:.6f}, "
+                f"score_max={debug_info['score_max']:.6f}"
+            )
+        if "temporal_top_frames" in debug_info:
+            pairs = list(zip(debug_info["temporal_top_frames"], debug_info["temporal_top_values"]))
+            print(f"temporal top frames: {pairs}")
+        print(f"segments: {debug_info.get('segments', [])}")
+        print(
+            f"num_rois={len(rois)}, "
+            f"core_ratio={debug_info.get('core_ratio', 0.0):.4f}, "
+            f"outer_ratio={debug_info.get('outer_ratio', 0.0):.4f}"
+        )
+
+        for idx, roi in enumerate(rois):
+            print(
+                f"  ROI#{idx}: "
+                f"outer[t={roi['t0']}:{roi['t1']}, y={roi['y0']}:{roi['y1']}, x={roi['x0']}:{roi['x1']}] | "
+                f"core[t={roi['core_t0']}:{roi['core_t1']}, y={roi['core_y0']}:{roi['core_y1']}, x={roi['core_x0']}:{roi['core_x1']}]"
+            )
+        print("=" * 100 + "\n")
+
+    def _run_hybrid_roi_refine(
+        self,
+        latents: torch.Tensor,
+        latent_model_input: torch.Tensor,
+        timestep: torch.Tensor,
+        prompt_embeds: torch.Tensor,
+        negative_prompt_embeds: Optional[torch.Tensor],
+        guidance_scale: float,
+        use_dynamic_cfg: bool,
+        num_inference_steps: int,
+        t,
+        attention_kwargs: Optional[Dict[str, Any]],
+        large_index: int,
+        small_index: int,
+        step_idx: int,
+    ):
+        """
+        思路二：small 全图；router 选 ROI；large 只跑 crop；仅 core 回填到 noise_small。
+        """
+        noise_small, small_time_cond, small_time_cfg = self._predict_noise_cfg(
+            transformer=self.transformers[small_index],
+            latent_model_input=latent_model_input,
+            timestep=timestep,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+            guidance_scale=guidance_scale,
+            use_dynamic_cfg=use_dynamic_cfg,
+            num_inference_steps=num_inference_steps,
+            t=t,
+            attention_kwargs=attention_kwargs,
+        )
+
+        rois, router_debug = self.roi_router.build_rois(latents.detach().float(), step_idx=step_idx)
+        self._log_router_debug(step_idx, router_debug)
+
+        noise_fused = noise_small.clone()
+
+        total_large_cond = 0.0
+        total_large_cfg = 0.0
+        crop_debug = []
+
+        for roi_idx, roi in enumerate(rois):
+            crop_input = latent_model_input[
+                :,
+                :,
+                roi["t0"]:roi["t1"],
+                roi["y0"]:roi["y1"],
+                roi["x0"]:roi["x1"],
+            ]
+
+            if crop_input.shape[2] <= 0 or crop_input.shape[3] <= 0 or crop_input.shape[4] <= 0:
+                print(f"[WARN] step={step_idx}, roi#{roi_idx} crop_input has invalid shape: {tuple(crop_input.shape)}")
+                continue
+
+            t0_crop = time_module.perf_counter()
+            noise_large_crop, large_cond, large_cfg = self._predict_noise_cfg(
+                transformer=self.transformers[large_index],
+                latent_model_input=crop_input,
+                timestep=timestep,
+                prompt_embeds=prompt_embeds,
+                negative_prompt_embeds=negative_prompt_embeds,
+                guidance_scale=guidance_scale,
+                use_dynamic_cfg=use_dynamic_cfg,
+                num_inference_steps=num_inference_steps,
+                t=t,
+                attention_kwargs=attention_kwargs,
+            )
+            crop_time = time_module.perf_counter() - t0_crop
+
+            total_large_cond += large_cond
+            total_large_cfg += large_cfg
+
+            noise_fused[
+                :,
+                :,
+                roi["core_t0"]:roi["core_t1"],
+                roi["core_y0"]:roi["core_y1"],
+                roi["core_x0"]:roi["core_x1"],
+            ] = noise_large_crop[
+                :,
+                :,
+                roi["local_core_t0"]:roi["local_core_t1"],
+                roi["local_core_y0"]:roi["local_core_y1"],
+                roi["local_core_x0"]:roi["local_core_x1"],
+            ]
+
+            crop_debug.append({
+                "roi_idx": roi_idx,
+                "outer_shape": tuple(crop_input.shape),
+                "crop_time": crop_time,
+                "outer_coords": (roi["t0"], roi["t1"], roi["y0"], roi["y1"], roi["x0"], roi["x1"]),
+                "core_coords": (roi["core_t0"], roi["core_t1"], roi["core_y0"], roi["core_y1"], roi["core_x0"], roi["core_x1"]),
+            })
+
+        print("\n" + "-" * 100)
+        print(f"[Hybrid ROI Refine] step={step_idx}")
+        print(f"small full time = {small_time_cond + small_time_cfg:.3f}s")
+        print(f"large roi total time = {total_large_cond + total_large_cfg:.3f}s")
+        for cit in crop_debug:
+            print(
+                f"  crop#{cit['roi_idx']}: outer_shape={cit['outer_shape']}, "
+                f"time={cit['crop_time']:.3f}s, "
+                f"outer={cit['outer_coords']}, core={cit['core_coords']}"
+            )
+        print("-" * 100 + "\n")
+
+        total_cond = small_time_cond + total_large_cond
+        total_cfg = small_time_cfg + total_large_cfg
+        return noise_fused, total_cond, total_cfg, router_debug
+
     def _get_t5_prompt_embeds(
         self,
         prompt: Union[str, List[str]] = None,
@@ -762,8 +837,8 @@ class HybridWanPipeline(WanPipeline):
         
         # Store input data dimensions for output
         input_batch = latents.shape[0]
-        input_time = latents.shape[1]  # Temporal frames in latent space
-        input_channel = latents.shape[2]
+        input_channel = latents.shape[1]
+        input_time = latents.shape[2]  # Wan: [B, C, T, H, W]
         input_height = latents.shape[3]
         input_width = latents.shape[4]
         seq_length = input_time * input_height * input_width
@@ -881,8 +956,8 @@ class HybridWanPipeline(WanPipeline):
                         attention_kwargs=attention_kwargs,
                     )
                 elif mode == "hybrid":
-                    noise_small, small_time_cond, small_time_cfg = self._predict_noise_cfg(
-                        transformer=self.transformers[small_index],
+                    noise_pred, model_time_cond, model_time_cfg, _router_dbg = self._run_hybrid_roi_refine(
+                        latents=latents,
                         latent_model_input=latent_model_input,
                         timestep=timestep,
                         prompt_embeds=prompt_embeds,
@@ -892,25 +967,10 @@ class HybridWanPipeline(WanPipeline):
                         num_inference_steps=num_inference_steps,
                         t=t,
                         attention_kwargs=attention_kwargs,
+                        large_index=large_index,
+                        small_index=small_index,
+                        step_idx=i,
                     )
-                    noise_large, large_time_cond, large_time_cfg = self._predict_noise_cfg(
-                        transformer=self.transformers[large_index],
-                        latent_model_input=latent_model_input,
-                        timestep=timestep,
-                        prompt_embeds=prompt_embeds,
-                        negative_prompt_embeds=negative_prompt_embeds if do_classifier_free_guidance else None,
-                        guidance_scale=guidance_scale,
-                        use_dynamic_cfg=use_dynamic_cfg,
-                        num_inference_steps=num_inference_steps,
-                        t=t,
-                        attention_kwargs=attention_kwargs,
-                    )
-                    mask_3d = self._build_spatiotemporal_mask(latents)
-                    mask_ratio = mask_3d.float().mean().item()
-                    logger.info(f"Step {i}/{num_inference_steps}: hybrid mask ratio = {mask_ratio:.4f}")
-                    noise_pred = self._fuse_noise_by_mask(noise_small, noise_large, mask_3d)
-                    model_time_cond = small_time_cond + large_time_cond
-                    model_time_cfg = small_time_cfg + large_time_cfg
                 else:
                     raise ValueError(f"Unknown mode: {mode}")
 
@@ -984,6 +1044,7 @@ class HybridWanPipeline(WanPipeline):
                 self._update_hybrid_score(
                     latents_before=latents_before_step,
                     latents_after=latents.detach().float(),
+                    step_idx=i,
                 )
                 
                 # Convert latents back to prompt_embeds dtype (same as parent class)
