@@ -97,6 +97,16 @@ class Args:
         self.hybrid_spatial_top_ratio = 0.08
         self.hybrid_spatial_dilate = 1
 
+        self.hybrid_spatial_blur_kernel = 9
+        self.hybrid_spatial_peak_ratio = 0.60
+        self.hybrid_spatial_cc_min_area = 12
+        self.hybrid_spatial_min_bbox_ratio = 0.01
+        self.hybrid_spatial_max_bbox_ratio = 0.55
+
+        self.hybrid_projection_keep_ratio_h = 0.65
+        self.hybrid_projection_keep_ratio_w = 0.65
+        self.hybrid_projection_blur_kernel = 9
+
         self.hybrid_margin_t = 1
         self.hybrid_margin_h = 4
         self.hybrid_margin_w = 4

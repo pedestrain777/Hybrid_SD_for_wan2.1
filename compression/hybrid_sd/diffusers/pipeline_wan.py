@@ -127,6 +127,14 @@ class HybridWanPipeline(WanPipeline):
             "max_segments": 2,
             "spatial_top_ratio": 0.08,
             "spatial_dilate": 1,
+            "spatial_blur_kernel": 9,
+            "spatial_peak_ratio": 0.60,
+            "spatial_cc_min_area": 12,
+            "spatial_min_bbox_ratio": 0.01,
+            "spatial_max_bbox_ratio": 0.55,
+            "projection_keep_ratio_h": 0.65,
+            "projection_keep_ratio_w": 0.65,
+            "projection_blur_kernel": 9,
             "margin_t": 1,
             "margin_h": 4,
             "margin_w": 4,
@@ -253,17 +261,22 @@ class HybridWanPipeline(WanPipeline):
             return
 
         rois = debug_info.get("rois", [])
-        print("\n" + "=" * 100)
+        spatial_debug = debug_info.get("spatial_debug", [])
+
+        print("\n" + "=" * 120)
         print(f"[Hybrid ROI Router] step={step_idx}")
+
         if "score_mean" in debug_info:
             print(
                 f"score_mean={debug_info['score_mean']:.6f}, "
                 f"score_std={debug_info['score_std']:.6f}, "
                 f"score_max={debug_info['score_max']:.6f}"
             )
+
         if "temporal_top_frames" in debug_info:
             pairs = list(zip(debug_info["temporal_top_frames"], debug_info["temporal_top_values"]))
             print(f"temporal top frames: {pairs}")
+
         print(f"segments: {debug_info.get('segments', [])}")
         print(
             f"num_rois={len(rois)}, "
@@ -271,13 +284,25 @@ class HybridWanPipeline(WanPipeline):
             f"outer_ratio={debug_info.get('outer_ratio', 0.0):.4f}"
         )
 
+        for idx, sd in enumerate(spatial_debug):
+            print(
+                f"  SEG#{idx}: seg={sd['segment']}, seg_score={sd['seg_score']:.6f}, "
+                f"seed_pixels={sd['seed_pixels']}, largest_cc_pixels={sd['largest_cc_pixels']}, "
+                f"cc_bbox={sd['cc_bbox']}, cc_area_ratio={sd['cc_area_ratio']:.4f}, "
+                f"proj_bbox={sd['proj_bbox']}, proj_area_ratio={sd['proj_area_ratio']:.4f}, "
+                f"final_bbox={sd['final_bbox']}, final_area_ratio={sd['final_area_ratio']:.4f}, "
+                f"bbox_source={sd['bbox_source']}"
+            )
+
         for idx, roi in enumerate(rois):
             print(
                 f"  ROI#{idx}: "
+                f"source={roi.get('bbox_source', 'NA')} | "
                 f"outer[t={roi['t0']}:{roi['t1']}, y={roi['y0']}:{roi['y1']}, x={roi['x0']}:{roi['x1']}] | "
                 f"core[t={roi['core_t0']}:{roi['core_t1']}, y={roi['core_y0']}:{roi['core_y1']}, x={roi['core_x0']}:{roi['core_x1']}]"
             )
-        print("=" * 100 + "\n")
+
+        print("=" * 120 + "\n")
 
     def _run_hybrid_roi_refine(
         self,
