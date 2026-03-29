@@ -121,7 +121,14 @@ class HybridWanPipeline(WanPipeline):
         # 思路二：hybrid 阶段 = FullSmall + Large ROI crop refine
         self.hybrid_roi_config: Dict[str, Any] = {
             "ema_alpha": 0.85,
+            "aux_ema_alpha": 0.70,
             "relative_diff": True,
+            "step_diff_weight": 1.0,
+            "ls_gap_weight": 0.8,
+            "motion_weight": 0.5,
+            "ls_gap_every": 2,
+            "force_ls_gap_first": True,
+            "motion_blur_kernel": 3,
             "temporal_top_ratio": 0.15,
             "temporal_dilate": 1,
             "max_segments": 2,
@@ -132,6 +139,9 @@ class HybridWanPipeline(WanPipeline):
             "spatial_cc_min_area": 12,
             "spatial_min_bbox_ratio": 0.01,
             "spatial_max_bbox_ratio": 0.55,
+            "max_rois_per_segment": 2,
+            "max_total_rois": 4,
+            "roi_nms_iou_thresh": 0.12,
             "projection_keep_ratio_h": 0.65,
             "projection_keep_ratio_w": 0.65,
             "projection_blur_kernel": 9,
@@ -263,7 +273,7 @@ class HybridWanPipeline(WanPipeline):
         rois = debug_info.get("rois", [])
         spatial_debug = debug_info.get("spatial_debug", [])
 
-        print("\n" + "=" * 120)
+        print("\n" + "=" * 140)
         print(f"[Hybrid ROI Router] step={step_idx}")
 
         if "score_mean" in debug_info:
@@ -271,6 +281,12 @@ class HybridWanPipeline(WanPipeline):
                 f"score_mean={debug_info['score_mean']:.6f}, "
                 f"score_std={debug_info['score_std']:.6f}, "
                 f"score_max={debug_info['score_max']:.6f}"
+            )
+
+        if "cue_weights" in debug_info:
+            print(
+                f"cue_weights={debug_info['cue_weights']}, "
+                f"ls_gap_last_step={debug_info.get('ls_gap_last_step', None)}"
             )
 
         if "temporal_top_frames" in debug_info:
@@ -287,22 +303,32 @@ class HybridWanPipeline(WanPipeline):
         for idx, sd in enumerate(spatial_debug):
             print(
                 f"  SEG#{idx}: seg={sd['segment']}, seg_score={sd['seg_score']:.6f}, "
-                f"seed_pixels={sd['seed_pixels']}, largest_cc_pixels={sd['largest_cc_pixels']}, "
-                f"cc_bbox={sd['cc_bbox']}, cc_area_ratio={sd['cc_area_ratio']:.4f}, "
-                f"proj_bbox={sd['proj_bbox']}, proj_area_ratio={sd['proj_area_ratio']:.4f}, "
-                f"final_bbox={sd['final_bbox']}, final_area_ratio={sd['final_area_ratio']:.4f}, "
-                f"bbox_source={sd['bbox_source']}"
+                f"num_components_total={sd['num_components_total']}, "
+                f"num_components_valid={sd['num_components_valid']}, "
+                f"proj_bbox={sd['proj_bbox']}, proj_area_ratio={sd['proj_area_ratio']:.4f}"
             )
+            for comp in sd.get("components", [])[:6]:
+                print(
+                    f"      comp#{comp['comp_id']}: "
+                    f"bbox={comp['bbox']}, pixels={comp['pixels']}, "
+                    f"bbox_area_ratio={comp['bbox_area_ratio']:.4f}, "
+                    f"score_mean={comp['score_mean']:.4f}, "
+                    f"score_sum={comp['score_sum']:.4f}, "
+                    f"valid={comp['valid']}"
+                )
 
         for idx, roi in enumerate(rois):
             print(
                 f"  ROI#{idx}: "
                 f"source={roi.get('bbox_source', 'NA')} | "
+                f"seg_rank={roi.get('seg_rank', 'NA')} | "
+                f"seg_score={roi.get('seg_score', 0.0):.4f} | "
+                f"comp_score={roi.get('comp_score', 0.0):.4f} | "
                 f"outer[t={roi['t0']}:{roi['t1']}, y={roi['y0']}:{roi['y1']}, x={roi['x0']}:{roi['x1']}] | "
                 f"core[t={roi['core_t0']}:{roi['core_t1']}, y={roi['core_y0']}:{roi['core_y1']}, x={roi['core_x0']}:{roi['core_x1']}]"
             )
 
-        print("=" * 120 + "\n")
+        print("=" * 140 + "\n")
 
     def _run_hybrid_roi_refine(
         self,
@@ -321,7 +347,8 @@ class HybridWanPipeline(WanPipeline):
         step_idx: int,
     ):
         """
-        思路二：small 全图；router 选 ROI；large 只跑 crop；仅 core 回填到 noise_small。
+        small 全图；周期性 full-large 刷新 ls_gap；observe_aux 更新 motion/ls_gap；
+        组合 score 建多 ROI；large 回填 core（refresh 步复用同一步 full-large）。
         """
         noise_small, small_time_cond, small_time_cfg = self._predict_noise_cfg(
             transformer=self.transformers[small_index],
@@ -336,32 +363,17 @@ class HybridWanPipeline(WanPipeline):
             attention_kwargs=attention_kwargs,
         )
 
-        rois, router_debug = self.roi_router.build_rois(latents.detach().float(), step_idx=step_idx)
-        self._log_router_debug(step_idx, router_debug)
+        need_ls_gap_refresh = self.roi_router.should_refresh_ls_gap(step_idx)
+        noise_large_full = None
+        ls_gap_map = None
+        full_large_time_cond = 0.0
+        full_large_time_cfg = 0.0
 
-        noise_fused = noise_small.clone()
-
-        total_large_cond = 0.0
-        total_large_cfg = 0.0
-        crop_debug = []
-
-        for roi_idx, roi in enumerate(rois):
-            crop_input = latent_model_input[
-                :,
-                :,
-                roi["t0"]:roi["t1"],
-                roi["y0"]:roi["y1"],
-                roi["x0"]:roi["x1"],
-            ]
-
-            if crop_input.shape[2] <= 0 or crop_input.shape[3] <= 0 or crop_input.shape[4] <= 0:
-                print(f"[WARN] step={step_idx}, roi#{roi_idx} crop_input has invalid shape: {tuple(crop_input.shape)}")
-                continue
-
-            t0_crop = time_module.perf_counter()
-            noise_large_crop, large_cond, large_cfg = self._predict_noise_cfg(
+        if need_ls_gap_refresh:
+            print(f"[Hybrid ROI Refine] step={step_idx}: refreshing full large-small gap map")
+            noise_large_full, full_large_time_cond, full_large_time_cfg = self._predict_noise_cfg(
                 transformer=self.transformers[large_index],
-                latent_model_input=crop_input,
+                latent_model_input=latent_model_input,
                 timestep=timestep,
                 prompt_embeds=prompt_embeds,
                 negative_prompt_embeds=negative_prompt_embeds,
@@ -371,44 +383,122 @@ class HybridWanPipeline(WanPipeline):
                 t=t,
                 attention_kwargs=attention_kwargs,
             )
-            crop_time = time_module.perf_counter() - t0_crop
+            ls_gap_map = (noise_small.detach().float() - noise_large_full.detach().float()).abs().mean(dim=1)
+            print(
+                f"[Hybrid ROI Refine] step={step_idx}: ls_gap_map stats -> "
+                f"mean={ls_gap_map.mean().item():.6f}, std={ls_gap_map.std().item():.6f}, max={ls_gap_map.max().item():.6f}"
+            )
 
-            total_large_cond += large_cond
-            total_large_cfg += large_cfg
+        self.roi_router.observe_aux(
+            latents=latents.detach().float(),
+            ls_gap_map=ls_gap_map,
+            step_idx=step_idx,
+        )
 
-            noise_fused[
-                :,
-                :,
-                roi["core_t0"]:roi["core_t1"],
-                roi["core_y0"]:roi["core_y1"],
-                roi["core_x0"]:roi["core_x1"],
-            ] = noise_large_crop[
-                :,
-                :,
-                roi["local_core_t0"]:roi["local_core_t1"],
-                roi["local_core_y0"]:roi["local_core_y1"],
-                roi["local_core_x0"]:roi["local_core_x1"],
-            ]
+        rois, router_debug = self.roi_router.build_rois(latents.detach().float(), step_idx=step_idx)
+        self._log_router_debug(step_idx, router_debug)
 
-            crop_debug.append({
-                "roi_idx": roi_idx,
-                "outer_shape": tuple(crop_input.shape),
-                "crop_time": crop_time,
-                "outer_coords": (roi["t0"], roi["t1"], roi["y0"], roi["y1"], roi["x0"], roi["x1"]),
-                "core_coords": (roi["core_t0"], roi["core_t1"], roi["core_y0"], roi["core_y1"], roi["core_x0"], roi["core_x1"]),
-            })
+        noise_fused = noise_small.clone()
 
-        print("\n" + "-" * 100)
+        total_large_cond = 0.0
+        total_large_cfg = 0.0
+        crop_debug = []
+
+        if noise_large_full is not None:
+            for roi_idx, roi in enumerate(rois):
+                noise_fused[
+                    :,
+                    :,
+                    roi["core_t0"]:roi["core_t1"],
+                    roi["core_y0"]:roi["core_y1"],
+                    roi["core_x0"]:roi["core_x1"],
+                ] = noise_large_full[
+                    :,
+                    :,
+                    roi["core_t0"]:roi["core_t1"],
+                    roi["core_y0"]:roi["core_y1"],
+                    roi["core_x0"]:roi["core_x1"],
+                ]
+
+                crop_debug.append({
+                    "roi_idx": roi_idx,
+                    "mode": "reuse_full_large",
+                    "outer_shape": tuple(latent_model_input.shape),
+                    "crop_time": 0.0,
+                    "outer_coords": (roi["t0"], roi["t1"], roi["y0"], roi["y1"], roi["x0"], roi["x1"]),
+                    "core_coords": (roi["core_t0"], roi["core_t1"], roi["core_y0"], roi["core_y1"], roi["core_x0"], roi["core_x1"]),
+                })
+
+            total_large_cond += full_large_time_cond
+            total_large_cfg += full_large_time_cfg
+
+        else:
+            for roi_idx, roi in enumerate(rois):
+                crop_input = latent_model_input[
+                    :,
+                    :,
+                    roi["t0"]:roi["t1"],
+                    roi["y0"]:roi["y1"],
+                    roi["x0"]:roi["x1"],
+                ]
+
+                if crop_input.shape[2] <= 0 or crop_input.shape[3] <= 0 or crop_input.shape[4] <= 0:
+                    print(f"[WARN] step={step_idx}, roi#{roi_idx} crop_input invalid: {tuple(crop_input.shape)}")
+                    continue
+
+                t0_crop = time_module.perf_counter()
+                noise_large_crop, large_cond, large_cfg = self._predict_noise_cfg(
+                    transformer=self.transformers[large_index],
+                    latent_model_input=crop_input,
+                    timestep=timestep,
+                    prompt_embeds=prompt_embeds,
+                    negative_prompt_embeds=negative_prompt_embeds,
+                    guidance_scale=guidance_scale,
+                    use_dynamic_cfg=use_dynamic_cfg,
+                    num_inference_steps=num_inference_steps,
+                    t=t,
+                    attention_kwargs=attention_kwargs,
+                )
+                crop_time = time_module.perf_counter() - t0_crop
+
+                total_large_cond += large_cond
+                total_large_cfg += large_cfg
+
+                noise_fused[
+                    :,
+                    :,
+                    roi["core_t0"]:roi["core_t1"],
+                    roi["core_y0"]:roi["core_y1"],
+                    roi["core_x0"]:roi["core_x1"],
+                ] = noise_large_crop[
+                    :,
+                    :,
+                    roi["local_core_t0"]:roi["local_core_t1"],
+                    roi["local_core_y0"]:roi["local_core_y1"],
+                    roi["local_core_x0"]:roi["local_core_x1"],
+                ]
+
+                crop_debug.append({
+                    "roi_idx": roi_idx,
+                    "mode": "roi_crop",
+                    "outer_shape": tuple(crop_input.shape),
+                    "crop_time": crop_time,
+                    "outer_coords": (roi["t0"], roi["t1"], roi["y0"], roi["y1"], roi["x0"], roi["x1"]),
+                    "core_coords": (roi["core_t0"], roi["core_t1"], roi["core_y0"], roi["core_y1"], roi["core_x0"], roi["core_x1"]),
+                })
+
+        print("\n" + "-" * 120)
         print(f"[Hybrid ROI Refine] step={step_idx}")
         print(f"small full time = {small_time_cond + small_time_cfg:.3f}s")
-        print(f"large roi total time = {total_large_cond + total_large_cfg:.3f}s")
-        for cit in crop_debug:
+        print(f"large branch total time = {total_large_cond + total_large_cfg:.3f}s")
+        print(f"ls_gap_refresh = {need_ls_gap_refresh}")
+        for item in crop_debug:
             print(
-                f"  crop#{cit['roi_idx']}: outer_shape={cit['outer_shape']}, "
-                f"time={cit['crop_time']:.3f}s, "
-                f"outer={cit['outer_coords']}, core={cit['core_coords']}"
+                f"  crop#{item['roi_idx']}: mode={item['mode']}, "
+                f"outer_shape={item['outer_shape']}, time={item['crop_time']:.3f}s, "
+                f"outer={item['outer_coords']}, core={item['core_coords']}"
             )
-        print("-" * 100 + "\n")
+        print("-" * 120 + "\n")
 
         total_cond = small_time_cond + total_large_cond
         total_cfg = small_time_cfg + total_large_cfg

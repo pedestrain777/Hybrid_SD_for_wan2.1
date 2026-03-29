@@ -46,26 +46,16 @@ def _bbox_area(bbox: Tuple[int, int, int, int]) -> int:
 
 
 def _expand_align_bounds(
-    start: int,
-    end: int,
-    limit: int,
-    margin: int,
-    min_size: int,
-    align: int,
+    start: int, end: int, limit: int, margin: int, min_size: int, align: int
 ) -> Tuple[int, int]:
     start = max(0, start - margin)
     end = min(limit, end + margin)
-
     if end <= start:
         end = min(limit, start + 1)
-
     size = max(end - start, min_size)
-
     if align > 1:
         size = int(math.ceil(size / align) * align)
-
     size = min(size, limit)
-
     center = 0.5 * (start + end)
     new_start = int(round(center - size / 2.0))
     new_start = max(0, min(new_start, limit - size))
@@ -80,7 +70,7 @@ def _interval_iou(a0: int, a1: int, b0: int, b1: int) -> float:
     return inter / union
 
 
-def _roi_iou(a: Dict[str, int], b: Dict[str, int]) -> float:
+def _roi_iou(a: Dict[str, Any], b: Dict[str, Any]) -> float:
     it = _interval_iou(a["core_t0"], a["core_t1"], b["core_t0"], b["core_t1"])
     iy = _interval_iou(a["core_y0"], a["core_y1"], b["core_y0"], b["core_y1"])
     ix = _interval_iou(a["core_x0"], a["core_x1"], b["core_x0"], b["core_x1"])
@@ -103,19 +93,24 @@ def _smooth1d(x: torch.Tensor, k: int) -> torch.Tensor:
     return F.avg_pool1d(x[None, None], kernel_size=k, stride=1, padding=k // 2)[0, 0]
 
 
-def _largest_connected_component(mask_2d: torch.Tensor, min_area: int = 1) -> torch.Tensor:
-    """
-    4-connected largest CC.
-    对 90x160 这种 latent 空间来说，Python BFS 完全够用。
-    """
+def _normalize_map_per_sample(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    if x is None:
+        return None
+    if x.ndim != 4:
+        raise ValueError(f"Expected [B,T,H,W], got shape={tuple(x.shape)}")
+    flat = x.reshape(x.shape[0], -1)
+    xmin = flat.min(dim=1).values[:, None, None, None]
+    xmax = flat.max(dim=1).values[:, None, None, None]
+    return (x - xmin) / (xmax - xmin).clamp_min(1e-6)
+
+
+def _extract_connected_components(mask_2d: torch.Tensor, min_area: int = 1) -> List[Dict[str, Any]]:
     h, w = mask_2d.shape
     mask_cpu = mask_2d.detach().to(torch.bool).cpu()
     visited = torch.zeros((h, w), dtype=torch.bool)
-
-    best_pts = []
-    best_area = 0
     neighbors = [(-1, 0), (1, 0), (0, -1), (0, 1)]
 
+    comps = []
     for y in range(h):
         for x in range(w):
             if not mask_cpu[y, x] or visited[y, x]:
@@ -134,21 +129,24 @@ def _largest_connected_component(mask_2d: torch.Tensor, min_area: int = 1) -> to
                         visited[ny, nx] = True
                         q.append((ny, nx))
 
-            if len(pts) >= min_area and len(pts) > best_area:
-                best_pts = pts
-                best_area = len(pts)
+            if len(pts) < min_area:
+                continue
 
-    out = torch.zeros((h, w), dtype=torch.bool, device=mask_2d.device)
-    for y, x in best_pts:
-        out[y, x] = True
-    return out
+            out_mask = torch.zeros((h, w), dtype=torch.bool, device=mask_2d.device)
+            for py, px in pts:
+                out_mask[py, px] = True
+
+            bbox = _bbox_from_mask(out_mask)
+            comps.append({
+                "mask": out_mask,
+                "bbox": bbox,
+                "pixels": len(pts),
+            })
+
+    return comps
 
 
 def _mass_window_1d(v: torch.Tensor, keep_ratio: float) -> Tuple[int, int]:
-    """
-    以峰值为中心，向两边扩，直到覆盖 keep_ratio 的总能量。
-    返回 [start, end)。
-    """
     n = v.numel()
     if n == 0:
         return 0, 0
@@ -182,36 +180,31 @@ def _mass_window_1d(v: torch.Tensor, keep_ratio: float) -> Tuple[int, int]:
 
 
 def _bbox_from_projection_mass(
-    score_2d: torch.Tensor,
-    keep_ratio_h: float,
-    keep_ratio_w: float,
-    blur_kernel: int,
+    score_2d: torch.Tensor, keep_ratio_h: float, keep_ratio_w: float, blur_kernel: int
 ) -> Tuple[int, int, int, int]:
-    """
-    沿 y / x 投影后，取主要能量窗口，构造 bbox。
-    """
     row_energy = _smooth1d(score_2d.sum(dim=1), blur_kernel)
     col_energy = _smooth1d(score_2d.sum(dim=0), blur_kernel)
-
     y0, y1 = _mass_window_1d(row_energy, keep_ratio_h)
     x0, x1 = _mass_window_1d(col_energy, keep_ratio_w)
-
     return int(y0), int(y1), int(x0), int(x1)
 
 
 class VideoMaskRouter:
     """
-    改进版 ROI router：
-
-    1) score_ema 仍然来自 step-to-step latent diff
-    2) 时间上选 hard segments
-    3) 空间上：blur -> seed -> largest CC -> bbox；不合理则用 projection fallback
+    step_diff + large-small gap + motion 融合；多连通域 -> 多 ROI + NMS。
     """
 
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         self.config: Dict[str, Any] = {
             "ema_alpha": 0.85,
+            "aux_ema_alpha": 0.70,
             "relative_diff": True,
+            "step_diff_weight": 1.0,
+            "ls_gap_weight": 0.8,
+            "motion_weight": 0.5,
+            "ls_gap_every": 2,
+            "force_ls_gap_first": True,
+            "motion_blur_kernel": 3,
             "temporal_top_ratio": 0.15,
             "temporal_dilate": 1,
             "max_segments": 2,
@@ -222,6 +215,9 @@ class VideoMaskRouter:
             "spatial_cc_min_area": 12,
             "spatial_min_bbox_ratio": 0.01,
             "spatial_max_bbox_ratio": 0.55,
+            "max_rois_per_segment": 2,
+            "max_total_rois": 4,
+            "roi_nms_iou_thresh": 0.12,
             "projection_keep_ratio_h": 0.65,
             "projection_keep_ratio_w": 0.65,
             "projection_blur_kernel": 9,
@@ -250,21 +246,53 @@ class VideoMaskRouter:
             self.config.update(config)
 
     def reset(self):
-        self.score_ema: Optional[torch.Tensor] = None  # [B, T, H, W]
-        self.prev_rois: List[Dict[str, int]] = []
+        self.score_ema: Optional[torch.Tensor] = None
+        self.ls_gap_ema: Optional[torch.Tensor] = None
+        self.motion_ema: Optional[torch.Tensor] = None
+        self.prev_rois: List[Dict[str, Any]] = []
+        self.last_ls_gap_step: int = -10**9
 
     def compute_diff_map(self, latents_before: torch.Tensor, latents_after: torch.Tensor) -> torch.Tensor:
-        """
-        latents: [B, C, T, H, W]
-        return:  [B, T, H, W]
-        """
         diff = (latents_before - latents_after).abs().mean(dim=1)
-
         if self.config.get("relative_diff", True):
             denom = latents_before.abs().mean(dim=1).clamp_min(1e-6)
             diff = diff / denom
-
         return diff.float()
+
+    def compute_motion_map(self, latents: torch.Tensor) -> torch.Tensor:
+        if latents.shape[2] <= 1:
+            return torch.zeros(
+                (latents.shape[0], 1, latents.shape[3], latents.shape[4]),
+                device=latents.device,
+                dtype=torch.float32,
+            )
+
+        diff_t = (latents[:, :, 1:] - latents[:, :, :-1]).abs().mean(dim=1)
+
+        motion = torch.zeros(
+            (latents.shape[0], latents.shape[2], latents.shape[3], latents.shape[4]),
+            device=latents.device,
+            dtype=diff_t.dtype,
+        )
+        count = torch.zeros_like(motion)
+
+        motion[:, 1:] += diff_t
+        count[:, 1:] += 1
+        motion[:, :-1] += diff_t
+        count[:, :-1] += 1
+
+        motion = motion / count.clamp_min(1.0)
+
+        k = int(self.config.get("motion_blur_kernel", 3))
+        if k > 1:
+            if k % 2 == 0:
+                k += 1
+            b, t, h, w = motion.shape
+            # [B*T,H,W] 不能复用 _smooth2d（会对 3D 多叠一维变成 5D）；用 [N,1,H,W] 逐帧平滑
+            x = motion.reshape(b * t, 1, h, w)
+            motion = F.avg_pool2d(x, kernel_size=k, stride=1, padding=k // 2).reshape(b, t, h, w)
+
+        return motion.float()
 
     def observe(self, latents_before: torch.Tensor, latents_after: torch.Tensor, step_idx: int) -> torch.Tensor:
         new_score = self.compute_diff_map(latents_before, latents_after)
@@ -277,6 +305,72 @@ class VideoMaskRouter:
 
         return self.score_ema
 
+    def should_refresh_ls_gap(self, step_idx: int) -> bool:
+        every = int(self.config.get("ls_gap_every", 0))
+        force_first = bool(self.config.get("force_ls_gap_first", True))
+
+        if self.ls_gap_ema is None and force_first:
+            return True
+
+        if every > 0 and (step_idx - self.last_ls_gap_step) >= every:
+            return True
+
+        return False
+
+    def observe_aux(self, latents: torch.Tensor, ls_gap_map: Optional[torch.Tensor], step_idx: int):
+        alpha = float(self.config.get("aux_ema_alpha", 0.70))
+
+        motion_map = self.compute_motion_map(latents)
+        if self.motion_ema is None:
+            self.motion_ema = motion_map
+        else:
+            self.motion_ema = alpha * self.motion_ema + (1.0 - alpha) * motion_map
+
+        if ls_gap_map is not None:
+            ls_gap_map = ls_gap_map.float()
+            if self.ls_gap_ema is None:
+                self.ls_gap_ema = ls_gap_map
+            else:
+                self.ls_gap_ema = alpha * self.ls_gap_ema + (1.0 - alpha) * ls_gap_map
+            self.last_ls_gap_step = step_idx
+
+    def _compose_score_maps(self) -> Dict[str, Optional[torch.Tensor]]:
+        cues = {
+            "step_diff": _normalize_map_per_sample(self.score_ema),
+            "ls_gap": _normalize_map_per_sample(self.ls_gap_ema),
+            "motion": _normalize_map_per_sample(self.motion_ema),
+        }
+
+        weights = {
+            "step_diff": float(self.config.get("step_diff_weight", 1.0)),
+            "ls_gap": float(self.config.get("ls_gap_weight", 0.8)),
+            "motion": float(self.config.get("motion_weight", 0.5)),
+        }
+
+        combined: Optional[torch.Tensor] = None
+        wsum = 0.0
+        for name, m in cues.items():
+            if m is None:
+                continue
+            w = max(0.0, weights[name])
+            if w <= 0:
+                continue
+            combined = m * w if combined is None else combined + m * w
+            wsum += w
+
+        if combined is None:
+            if self.score_ema is not None:
+                combined = torch.zeros_like(self.score_ema)
+            elif self.motion_ema is not None:
+                combined = torch.zeros_like(self.motion_ema)
+            else:
+                raise RuntimeError("No cue available to compose score.")
+            wsum = 1.0
+
+        combined = combined / max(wsum, 1e-6)
+        cues["combined"] = combined
+        return cues
+
     def _make_roi(
         self,
         t_len: int,
@@ -288,27 +382,21 @@ class VideoMaskRouter:
         core_y1: int,
         core_x0: int,
         core_x1: int,
-    ) -> Dict[str, int]:
+    ) -> Dict[str, Any]:
         outer_t0, outer_t1 = _expand_align_bounds(
             core_t0, core_t1, t_len,
-            self.config["margin_t"],
-            self.config["min_crop_t"],
-            1,
+            self.config["margin_t"], self.config["min_crop_t"], 1,
         )
         outer_y0, outer_y1 = _expand_align_bounds(
             core_y0, core_y1, h,
-            self.config["margin_h"],
-            self.config["min_crop_h"],
-            self.config["align_h"],
+            self.config["margin_h"], self.config["min_crop_h"], self.config["align_h"],
         )
         outer_x0, outer_x1 = _expand_align_bounds(
             core_x0, core_x1, w,
-            self.config["margin_w"],
-            self.config["min_crop_w"],
-            self.config["align_w"],
+            self.config["margin_w"], self.config["min_crop_w"], self.config["align_w"],
         )
 
-        roi = {
+        roi: Dict[str, Any] = {
             "t0": outer_t0, "t1": outer_t1,
             "y0": outer_y0, "y1": outer_y1,
             "x0": outer_x0, "x1": outer_x1,
@@ -326,19 +414,20 @@ class VideoMaskRouter:
 
         return roi
 
-    def _smooth_rois(self, rois: List[Dict[str, int]]) -> List[Dict[str, int]]:
+    def _smooth_rois(self, rois: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if not self.prev_rois or not rois:
             return rois
 
         momentum = float(self.config.get("smooth_momentum", 0.6))
         iou_thresh = float(self.config.get("smooth_iou_thresh", 0.25))
 
-        smoothed_rois = []
+        smoothed_rois: List[Dict[str, Any]] = []
         used_prev = set()
 
         for roi in rois:
             best_idx = -1
             best_iou = 0.0
+
             for j, prev_roi in enumerate(self.prev_rois):
                 if j in used_prev:
                     continue
@@ -375,12 +464,9 @@ class VideoMaskRouter:
 
         return smoothed_rois
 
-    def build_rois(self, latents: torch.Tensor, step_idx: int) -> Tuple[List[Dict[str, int]], Dict[str, Any]]:
-        """
-        latents: [B, C, T, H, W]
-        """
+    def build_rois(self, latents: torch.Tensor, step_idx: int) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         bsz, _, t_len, h, w = latents.shape
-        assert bsz == 1, "当前 ROI refine 版本先只支持 batch_size=1。"
+        assert bsz == 1, "当前版本先只支持 batch_size=1。"
 
         if self.score_ema is None:
             full_roi = self._make_roi(t_len, h, w, 0, t_len, 0, h, 0, w)
@@ -393,9 +479,12 @@ class VideoMaskRouter:
             self.prev_rois = [full_roi]
             return [full_roi], debug
 
-        score = self.score_ema  # [1, T, H, W]
+        cue_maps = self._compose_score_maps()
+        combined = cue_maps["combined"]
+        assert combined is not None
+        full_area = max(1, h * w)
 
-        temporal_score = score.mean(dim=(2, 3))  # [1, T]
+        temporal_score = combined.mean(dim=(2, 3))
         temporal_mask = _topk_binary_mask(
             temporal_score,
             ratio=float(self.config["temporal_top_ratio"]),
@@ -420,13 +509,12 @@ class VideoMaskRouter:
         segment_scores.sort(reverse=True, key=lambda x: x[0])
         segment_scores = segment_scores[: int(self.config["max_segments"])]
 
-        rois = []
-        spatial_debug = []
-        debug_tensors = {}
-        full_area = max(1, h * w)
+        candidates: List[Dict[str, Any]] = []
+        spatial_debug: List[Dict[str, Any]] = []
+        debug_tensors: Dict[str, Any] = {}
 
         for seg_rank, (seg_score, s, e) in enumerate(segment_scores):
-            spatial_score_raw = score[0, s:e].mean(dim=0)   # [H, W]
+            spatial_score_raw = combined[0, s:e].mean(dim=0)
             spatial_score_blur = _smooth2d(
                 spatial_score_raw,
                 int(self.config["spatial_blur_kernel"])
@@ -442,8 +530,7 @@ class VideoMaskRouter:
             )[0]
 
             peak_ratio = float(self.config["spatial_peak_ratio"])
-            peak_max = float(spatial_score_norm.max().item())
-            peak_gate = spatial_score_norm >= (peak_ratio * peak_max)
+            peak_gate = spatial_score_norm >= (peak_ratio * float(spatial_score_norm.max().item()))
 
             seed_mask = seed_topk & peak_gate
             if seed_mask.sum().item() == 0:
@@ -458,12 +545,50 @@ class VideoMaskRouter:
                     padding=dilate_hw,
                 ).squeeze(0).squeeze(0) > 0
 
-            cc_mask = _largest_connected_component(
+            comps = _extract_connected_components(
                 seed_mask,
                 min_area=int(self.config["spatial_cc_min_area"]),
             )
-            cc_bbox = _bbox_from_mask(cc_mask)
-            cc_area_ratio = _bbox_area(cc_bbox) / full_area if cc_bbox is not None else 0.0
+
+            comp_infos = []
+            valid_comp_count = 0
+
+            min_ratio = float(self.config["spatial_min_bbox_ratio"])
+            max_ratio = float(self.config["spatial_max_bbox_ratio"])
+
+            for comp_id, comp in enumerate(comps):
+                bbox = comp["bbox"]
+                if bbox is None:
+                    continue
+                area_ratio = _bbox_area(bbox) / full_area
+                mask = comp["mask"]
+
+                score_mean = float(spatial_score_norm[mask].mean().item()) if mask.any() else 0.0
+                score_sum = float(spatial_score_norm[mask].sum().item()) if mask.any() else 0.0
+
+                comp_infos.append({
+                    "comp_id": comp_id,
+                    "bbox": list(bbox),
+                    "pixels": int(comp["pixels"]),
+                    "bbox_area_ratio": float(area_ratio),
+                    "score_mean": score_mean,
+                    "score_sum": score_sum,
+                    "valid": bool(min_ratio <= area_ratio <= max_ratio),
+                })
+
+                if min_ratio <= area_ratio <= max_ratio:
+                    valid_comp_count += 1
+                    y0, y1, x0, x1 = bbox
+                    roi = self._make_roi(
+                        t_len, h, w,
+                        s, e,
+                        y0, y1, x0, x1
+                    )
+                    roi["seg_rank"] = seg_rank
+                    roi["seg_score"] = seg_score
+                    roi["comp_score"] = score_sum
+                    roi["bbox_source"] = "multi_cc"
+                    candidates.append(roi)
 
             proj_bbox = _bbox_from_projection_mass(
                 spatial_score_norm,
@@ -473,68 +598,71 @@ class VideoMaskRouter:
             )
             proj_area_ratio = _bbox_area(proj_bbox) / full_area
 
-            bbox_source = "projection"
-            final_bbox = proj_bbox
-
-            if cc_bbox is not None:
-                min_ratio = float(self.config["spatial_min_bbox_ratio"])
-                max_ratio = float(self.config["spatial_max_bbox_ratio"])
-
-                if min_ratio <= cc_area_ratio <= max_ratio:
-                    final_bbox = cc_bbox
-                    bbox_source = "largest_cc"
-                elif cc_area_ratio > max_ratio:
-                    final_bbox = proj_bbox
-                    bbox_source = "projection_fallback_cc_too_large"
-                elif cc_area_ratio < min_ratio:
-                    final_bbox = proj_bbox
-                    bbox_source = "projection_fallback_cc_too_small"
-
-            y0, y1, x0, x1 = final_bbox
-
-            roi = self._make_roi(
-                t_len=t_len,
-                h=h,
-                w=w,
-                core_t0=s,
-                core_t1=e,
-                core_y0=y0,
-                core_y1=y1,
-                core_x0=x0,
-                core_x1=x1,
-            )
-            roi["seg_rank"] = seg_rank
-            roi["seg_score"] = seg_score
-            roi["bbox_source"] = bbox_source
-            rois.append(roi)
+            if valid_comp_count == 0:
+                y0, y1, x0, x1 = proj_bbox
+                roi = self._make_roi(
+                    t_len, h, w,
+                    s, e,
+                    y0, y1, x0, x1
+                )
+                roi["seg_rank"] = seg_rank
+                roi["seg_score"] = seg_score
+                roi["comp_score"] = float(spatial_score_norm[y0:y1, x0:x1].mean().item())
+                roi["bbox_source"] = "projection_fallback_no_valid_cc"
+                candidates.append(roi)
 
             spatial_debug.append({
                 "segment": [s, e],
                 "seg_score": seg_score,
-                "raw_min": float(spatial_score_raw.min().item()),
-                "raw_max": float(spatial_score_raw.max().item()),
-                "blur_min": smin,
-                "blur_max": smax,
-                "seed_pixels": int(seed_mask.sum().item()),
-                "largest_cc_pixels": int(cc_mask.sum().item()),
-                "cc_bbox": list(cc_bbox) if cc_bbox is not None else None,
-                "cc_area_ratio": float(cc_area_ratio),
+                "num_components_total": len(comps),
+                "num_components_valid": valid_comp_count,
                 "proj_bbox": list(proj_bbox),
                 "proj_area_ratio": float(proj_area_ratio),
-                "final_bbox": [y0, y1, x0, x1],
-                "final_area_ratio": float(_bbox_area(final_bbox) / full_area),
-                "bbox_source": bbox_source,
+                "components": comp_infos,
             })
 
             debug_tensors[f"seg{seg_rank}_spatial_score_raw"] = spatial_score_raw.detach().cpu()
             debug_tensors[f"seg{seg_rank}_spatial_score_blur"] = spatial_score_blur.detach().cpu()
             debug_tensors[f"seg{seg_rank}_spatial_score_norm"] = spatial_score_norm.detach().cpu()
             debug_tensors[f"seg{seg_rank}_seed_mask"] = seed_mask.detach().cpu()
-            debug_tensors[f"seg{seg_rank}_largest_cc_mask"] = cc_mask.detach().cpu()
 
-        if len(rois) == 0:
+        if len(candidates) == 0:
             full_roi = self._make_roi(t_len, h, w, 0, t_len, 0, h, 0, w)
-            rois = [full_roi]
+            candidates = [full_roi]
+
+        candidates = sorted(
+            candidates,
+            key=lambda r: (float(r.get("comp_score", 0.0)) + 0.5 * float(r.get("seg_score", 0.0))),
+            reverse=True
+        )
+
+        kept: List[Dict[str, Any]] = []
+        nms_thresh = float(self.config.get("roi_nms_iou_thresh", 0.12))
+        max_total = int(self.config.get("max_total_rois", 4))
+
+        for cand in candidates:
+            if len(kept) >= max_total:
+                break
+
+            overlap = False
+            for old in kept:
+                if _roi_iou(cand, old) > nms_thresh:
+                    overlap = True
+                    break
+
+            if not overlap:
+                kept.append(cand)
+
+        max_per_seg = int(self.config.get("max_rois_per_segment", 2))
+        seg_counter: Dict[int, int] = {}
+        rois: List[Dict[str, Any]] = []
+        for roi in kept:
+            seg_rank = int(roi.get("seg_rank", -1))
+            seg_counter.setdefault(seg_rank, 0)
+            if seg_rank >= 0 and seg_counter[seg_rank] >= max_per_seg:
+                continue
+            seg_counter[seg_rank] += 1
+            rois.append(roi)
 
         rois = sorted(rois, key=lambda r: (r["core_t0"], r["core_y0"], r["core_x0"]))
         rois = self._smooth_rois(rois)
@@ -560,9 +688,15 @@ class VideoMaskRouter:
         debug = {
             "step_idx": step_idx,
             "router_warm_start": False,
-            "score_mean": float(score.mean().item()),
-            "score_std": float(score.std().item()),
-            "score_max": float(score.max().item()),
+            "score_mean": float(combined.mean().item()),
+            "score_std": float(combined.std().item()),
+            "score_max": float(combined.max().item()),
+            "cue_weights": {
+                "step_diff": float(self.config.get("step_diff_weight", 1.0)),
+                "ls_gap": float(self.config.get("ls_gap_weight", 0.8)),
+                "motion": float(self.config.get("motion_weight", 0.5)),
+            },
+            "ls_gap_last_step": int(self.last_ls_gap_step),
             "temporal_top_frames": top_idx.tolist(),
             "temporal_top_values": [float(v) for v in top_vals.tolist()],
             "segments": [(s, e) for _, s, e in segment_scores],
@@ -577,12 +711,20 @@ class VideoMaskRouter:
         if save_dir is not None and (step_idx % max(1, debug_every) == 0):
             os.makedirs(save_dir, exist_ok=True)
 
-            save_payload = {
-                "score_ema": score.detach().cpu(),
+            save_payload: Dict[str, Any] = {
+                "step_diff_ema": None if self.score_ema is None else self.score_ema.detach().cpu(),
+                "ls_gap_ema": None if self.ls_gap_ema is None else self.ls_gap_ema.detach().cpu(),
+                "motion_ema": None if self.motion_ema is None else self.motion_ema.detach().cpu(),
+                "combined_score": combined.detach().cpu(),
                 "temporal_score": temporal_score.detach().cpu(),
                 "temporal_mask": temporal_mask.detach().cpu(),
                 "debug": debug,
             }
+
+            for k, v in cue_maps.items():
+                if v is not None:
+                    save_payload[k] = v.detach().cpu()
+
             save_payload.update(debug_tensors)
 
             torch.save(save_payload, os.path.join(save_dir, f"router_step_{step_idx:03d}.pt"))

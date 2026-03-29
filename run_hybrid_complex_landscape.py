@@ -88,7 +88,16 @@ class Args:
 
         # ROI router（思路二）
         self.hybrid_ema_alpha = 0.85
+        self.hybrid_aux_ema_alpha = 0.70
         self.hybrid_relative_diff = True
+
+        self.hybrid_step_diff_weight = 1.0
+        self.hybrid_ls_gap_weight = 0.8
+        self.hybrid_motion_weight = 0.5
+
+        self.hybrid_ls_gap_every = 2
+        self.hybrid_force_ls_gap_first = True
+        self.hybrid_motion_blur_kernel = 3
 
         self.hybrid_temporal_top_ratio = 0.15
         self.hybrid_temporal_dilate = 1
@@ -106,6 +115,10 @@ class Args:
         self.hybrid_projection_keep_ratio_h = 0.65
         self.hybrid_projection_keep_ratio_w = 0.65
         self.hybrid_projection_blur_kernel = 9
+
+        self.hybrid_max_rois_per_segment = 2
+        self.hybrid_max_total_rois = 4
+        self.hybrid_roi_nms_iou_thresh = 0.12
 
         self.hybrid_margin_t = 1
         self.hybrid_margin_h = 4
