@@ -124,6 +124,7 @@ class HybridWanPipeline(WanPipeline):
             "aux_ema_alpha": 0.70,
             "relative_diff": True,
             "step_diff_weight": 1.0,
+            "cfg_gap_weight": 0.8,
             "ls_gap_weight": 0.8,
             "motion_weight": 0.5,
             "ls_gap_every": 2,
@@ -219,6 +220,7 @@ class HybridWanPipeline(WanPipeline):
         num_inference_steps: int,
         t,
         attention_kwargs: Optional[Dict[str, Any]],
+        return_aux: bool = False,
     ):
         t0 = time_module.perf_counter()
         noise_cond = transformer(
@@ -230,8 +232,26 @@ class HybridWanPipeline(WanPipeline):
         )[0]
         cond_time = time_module.perf_counter() - t0
 
+        aux = {
+            "noise_cond": noise_cond,
+            "noise_uncond": None,
+            "guidance_used": 1.0,
+            "cfg_gap_map": torch.zeros(
+                (
+                    latent_model_input.shape[0],
+                    latent_model_input.shape[2],
+                    latent_model_input.shape[3],
+                    latent_model_input.shape[4],
+                ),
+                device=latent_model_input.device,
+                dtype=noise_cond.dtype,
+            ),
+        }
+
         uncond_time = 0.0
         if negative_prompt_embeds is None or guidance_scale <= 1.0:
+            if return_aux:
+                return noise_cond, cond_time, uncond_time, aux
             return noise_cond, cond_time, uncond_time
 
         t1 = time_module.perf_counter()
@@ -251,7 +271,19 @@ class HybridWanPipeline(WanPipeline):
                 (1 - math.cos(math.pi * ((num_inference_steps - t_scalar) / num_inference_steps) ** 5.0)) / 2
             )
 
+        cfg_gap_map = (noise_cond.detach().float() - noise_uncond.detach().float()).abs().mean(dim=1)
+
+        aux = {
+            "noise_cond": noise_cond,
+            "noise_uncond": noise_uncond,
+            "guidance_used": float(cur_guidance),
+            "cfg_gap_map": cfg_gap_map,
+        }
+
         noise_pred = noise_uncond + cur_guidance * (noise_cond - noise_uncond)
+
+        if return_aux:
+            return noise_pred, cond_time, uncond_time, aux
         return noise_pred, cond_time, uncond_time
 
     def _update_hybrid_score(
@@ -286,6 +318,7 @@ class HybridWanPipeline(WanPipeline):
         if "cue_weights" in debug_info:
             print(
                 f"cue_weights={debug_info['cue_weights']}, "
+                f"cue_means={debug_info.get('cue_means', {})}, "
                 f"ls_gap_last_step={debug_info.get('ls_gap_last_step', None)}"
             )
 
@@ -347,10 +380,10 @@ class HybridWanPipeline(WanPipeline):
         step_idx: int,
     ):
         """
-        small 全图；周期性 full-large 刷新 ls_gap；observe_aux 更新 motion/ls_gap；
+        small 全图；可选 full-large 刷新 ls_gap；observe_aux 更新 cfg_gap/motion/ls_gap；
         组合 score 建多 ROI；large 回填 core（refresh 步复用同一步 full-large）。
         """
-        noise_small, small_time_cond, small_time_cfg = self._predict_noise_cfg(
+        noise_small, small_time_cond, small_time_cfg, small_aux = self._predict_noise_cfg(
             transformer=self.transformers[small_index],
             latent_model_input=latent_model_input,
             timestep=timestep,
@@ -361,6 +394,16 @@ class HybridWanPipeline(WanPipeline):
             num_inference_steps=num_inference_steps,
             t=t,
             attention_kwargs=attention_kwargs,
+            return_aux=True,
+        )
+
+        cfg_gap_map = small_aux["cfg_gap_map"].detach().float()
+        print(
+            f"[Hybrid ROI Refine] step={step_idx}: cfg_gap_map stats -> "
+            f"mean={cfg_gap_map.mean().item():.6f}, "
+            f"std={cfg_gap_map.std().item():.6f}, "
+            f"max={cfg_gap_map.max().item():.6f}, "
+            f"guidance_used={small_aux['guidance_used']:.4f}"
         )
 
         need_ls_gap_refresh = self.roi_router.should_refresh_ls_gap(step_idx)
@@ -391,6 +434,7 @@ class HybridWanPipeline(WanPipeline):
 
         self.roi_router.observe_aux(
             latents=latents.detach().float(),
+            cfg_gap_map=cfg_gap_map,
             ls_gap_map=ls_gap_map,
             step_idx=step_idx,
         )

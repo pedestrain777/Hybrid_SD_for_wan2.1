@@ -838,6 +838,7 @@ class HybridVideoInferencePipeline:
             "aux_ema_alpha": getattr(self.args, "hybrid_aux_ema_alpha", 0.70),
             "relative_diff": getattr(self.args, "hybrid_relative_diff", True),
             "step_diff_weight": getattr(self.args, "hybrid_step_diff_weight", 1.0),
+            "cfg_gap_weight": getattr(self.args, "hybrid_cfg_gap_weight", 0.8),
             "ls_gap_weight": getattr(self.args, "hybrid_ls_gap_weight", 0.8),
             "motion_weight": getattr(self.args, "hybrid_motion_weight", 0.5),
             "ls_gap_every": getattr(self.args, "hybrid_ls_gap_every", 2),

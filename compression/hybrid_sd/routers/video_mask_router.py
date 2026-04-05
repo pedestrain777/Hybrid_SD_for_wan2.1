@@ -191,7 +191,7 @@ def _bbox_from_projection_mass(
 
 class VideoMaskRouter:
     """
-    step_diff + large-small gap + motion 融合；多连通域 -> 多 ROI + NMS。
+    step_diff + small-CFG-gap + optional large-small gap + motion 融合；多连通域 -> 多 ROI + NMS。
     """
 
     def __init__(self, config: Optional[Dict[str, Any]] = None):
@@ -200,6 +200,7 @@ class VideoMaskRouter:
             "aux_ema_alpha": 0.70,
             "relative_diff": True,
             "step_diff_weight": 1.0,
+            "cfg_gap_weight": 0.8,
             "ls_gap_weight": 0.8,
             "motion_weight": 0.5,
             "ls_gap_every": 2,
@@ -247,6 +248,7 @@ class VideoMaskRouter:
 
     def reset(self):
         self.score_ema: Optional[torch.Tensor] = None
+        self.cfg_gap_ema: Optional[torch.Tensor] = None
         self.ls_gap_ema: Optional[torch.Tensor] = None
         self.motion_ema: Optional[torch.Tensor] = None
         self.prev_rois: List[Dict[str, Any]] = []
@@ -317,7 +319,13 @@ class VideoMaskRouter:
 
         return False
 
-    def observe_aux(self, latents: torch.Tensor, ls_gap_map: Optional[torch.Tensor], step_idx: int):
+    def observe_aux(
+        self,
+        latents: torch.Tensor,
+        cfg_gap_map: Optional[torch.Tensor] = None,
+        ls_gap_map: Optional[torch.Tensor] = None,
+        step_idx: int = -1,
+    ):
         alpha = float(self.config.get("aux_ema_alpha", 0.70))
 
         motion_map = self.compute_motion_map(latents)
@@ -325,6 +333,13 @@ class VideoMaskRouter:
             self.motion_ema = motion_map
         else:
             self.motion_ema = alpha * self.motion_ema + (1.0 - alpha) * motion_map
+
+        if cfg_gap_map is not None:
+            cfg_gap_map = cfg_gap_map.float()
+            if self.cfg_gap_ema is None:
+                self.cfg_gap_ema = cfg_gap_map
+            else:
+                self.cfg_gap_ema = alpha * self.cfg_gap_ema + (1.0 - alpha) * cfg_gap_map
 
         if ls_gap_map is not None:
             ls_gap_map = ls_gap_map.float()
@@ -337,12 +352,14 @@ class VideoMaskRouter:
     def _compose_score_maps(self) -> Dict[str, Optional[torch.Tensor]]:
         cues = {
             "step_diff": _normalize_map_per_sample(self.score_ema),
+            "cfg_gap": _normalize_map_per_sample(self.cfg_gap_ema),
             "ls_gap": _normalize_map_per_sample(self.ls_gap_ema),
             "motion": _normalize_map_per_sample(self.motion_ema),
         }
 
         weights = {
             "step_diff": float(self.config.get("step_diff_weight", 1.0)),
+            "cfg_gap": float(self.config.get("cfg_gap_weight", 0.8)),
             "ls_gap": float(self.config.get("ls_gap_weight", 0.8)),
             "motion": float(self.config.get("motion_weight", 0.5)),
         }
@@ -361,6 +378,8 @@ class VideoMaskRouter:
         if combined is None:
             if self.score_ema is not None:
                 combined = torch.zeros_like(self.score_ema)
+            elif self.cfg_gap_ema is not None:
+                combined = torch.zeros_like(self.cfg_gap_ema)
             elif self.motion_ema is not None:
                 combined = torch.zeros_like(self.motion_ema)
             else:
@@ -693,8 +712,13 @@ class VideoMaskRouter:
             "score_max": float(combined.max().item()),
             "cue_weights": {
                 "step_diff": float(self.config.get("step_diff_weight", 1.0)),
+                "cfg_gap": float(self.config.get("cfg_gap_weight", 0.8)),
                 "ls_gap": float(self.config.get("ls_gap_weight", 0.8)),
                 "motion": float(self.config.get("motion_weight", 0.5)),
+            },
+            "cue_means": {
+                name: (None if cue_maps.get(name) is None else float(cue_maps[name].mean().item()))
+                for name in ["step_diff", "cfg_gap", "ls_gap", "motion"]
             },
             "ls_gap_last_step": int(self.last_ls_gap_step),
             "temporal_top_frames": top_idx.tolist(),
@@ -713,6 +737,7 @@ class VideoMaskRouter:
 
             save_payload: Dict[str, Any] = {
                 "step_diff_ema": None if self.score_ema is None else self.score_ema.detach().cpu(),
+                "cfg_gap_ema": None if self.cfg_gap_ema is None else self.cfg_gap_ema.detach().cpu(),
                 "ls_gap_ema": None if self.ls_gap_ema is None else self.ls_gap_ema.detach().cpu(),
                 "motion_ema": None if self.motion_ema is None else self.motion_ema.detach().cpu(),
                 "combined_score": combined.detach().cpu(),
