@@ -126,11 +126,18 @@ class HybridWanPipeline(WanPipeline):
             "step_diff_weight": 1.0,
             "cfg_gap_weight": 0.8,
             "ls_gap_weight": 0.8,
-            "motion_weight": 0.5,
+            "motion_weight": 0.0,
+            "warp_weight": 0.5,
+            "traj_curv_weight": 0.5,
+            "traj_flip_weight": 0.3,
+            "use_warp_cue": True,
+            "warp_max_shift": 2,
             "ls_gap_every": 2,
             "force_ls_gap_first": True,
             "motion_blur_kernel": 3,
             "temporal_top_ratio": 0.15,
+            "temporal_topq_ratio": 0.10,
+            "temporal_pool": "topq",
             "temporal_dilate": 1,
             "max_segments": 2,
             "spatial_top_ratio": 0.08,
@@ -159,6 +166,9 @@ class HybridWanPipeline(WanPipeline):
             "debug_every": 1,
             "debug_topk_frames": 5,
             "save_debug_dir": None,
+            "use_tube_spatial": True,
+            "tube_link_iou_thresh": 0.15,
+            "tube_debug_max_frames": 8,
         }
         self.roi_router: VideoMaskRouter = VideoMaskRouter(self.hybrid_roi_config)
 
@@ -326,6 +336,14 @@ class HybridWanPipeline(WanPipeline):
             pairs = list(zip(debug_info["temporal_top_frames"], debug_info["temporal_top_values"]))
             print(f"temporal top frames: {pairs}")
 
+        if "temporal_pool" in debug_info:
+            print(
+                f"temporal_pool={debug_info.get('temporal_pool')} "
+                f"topq_ratio={debug_info.get('temporal_topq_ratio')} "
+                f"use_tube_spatial={debug_info.get('use_tube_spatial')} "
+                f"tube_iou={debug_info.get('tube_link_iou_thresh')}"
+            )
+
         print(f"segments: {debug_info.get('segments', [])}")
         print(
             f"num_rois={len(rois)}, "
@@ -334,12 +352,28 @@ class HybridWanPipeline(WanPipeline):
         )
 
         for idx, sd in enumerate(spatial_debug):
+            route = sd.get("spatial_routing", "NA")
+            extra = ""
+            if route == "tube":
+                extra = (
+                    f", tube_chains={sd.get('num_tube_chains', 0)}, "
+                    f"valid_tube_rois={sd.get('num_tube_rois_valid', 0)}, "
+                    f"fallback={sd.get('tube_fallback', '-')}"
+                )
             print(
-                f"  SEG#{idx}: seg={sd['segment']}, seg_score={sd['seg_score']:.6f}, "
-                f"num_components_total={sd['num_components_total']}, "
-                f"num_components_valid={sd['num_components_valid']}, "
-                f"proj_bbox={sd['proj_bbox']}, proj_area_ratio={sd['proj_area_ratio']:.4f}"
+                f"  SEG#{idx}: routing={route}{extra} | seg={sd['segment']}, seg_score={sd['seg_score']:.6f}, "
+                f"num_components_total={sd.get('num_components_total', 'NA')}, "
+                f"num_components_valid={sd.get('num_components_valid', 'NA')}, "
+                f"proj_bbox={sd.get('proj_bbox', 'NA')}, "
+                f"proj_area_ratio={sd.get('proj_area_ratio', 0.0):.4f}"
             )
+            if route == "tube" and sd.get("tube_chain_summaries"):
+                for ts in sd["tube_chain_summaries"][:4]:
+                    print(
+                        f"      tube#{ts.get('chain_id')}: frames={ts.get('frames')}, "
+                        f"union={ts.get('union_bbox')}, valid={ts.get('valid_union')}, "
+                        f"score_sum={ts.get('comp_score_sum', 0):.4f}"
+                    )
             for comp in sd.get("components", [])[:6]:
                 print(
                     f"      comp#{comp['comp_id']}: "
@@ -362,6 +396,77 @@ class HybridWanPipeline(WanPipeline):
             )
 
         print("=" * 140 + "\n")
+
+    def _paste_large_into_fused_core(
+        self,
+        noise_fused: torch.Tensor,
+        noise_large: torch.Tensor,
+        roi: Dict[str, Any],
+        *,
+        use_local_indices: bool,
+        step_idx: int,
+        roi_idx: int,
+    ) -> None:
+        """
+        将 large 分支输出贴回 noise_fused 的 core 区域。
+        outer 经 align/重算后可能未完全包住 core，local 索引相对 crop 实际尺寸会越界；
+        PyTorch 切片会静默截断，导致与全局 core_* 尺寸不一致。此处按张量实际形状对齐粘贴。
+        """
+        _, _, ff, fh, fw = noise_fused.shape
+        _, _, lf, lh, lw = noise_large.shape
+
+        if not use_local_indices:
+            ct0 = max(0, int(roi["core_t0"]))
+            ct1 = min(int(roi["core_t1"]), lf, ff)
+            cy0 = max(0, int(roi["core_y0"]))
+            cy1 = min(int(roi["core_y1"]), lh, fh)
+            cx0 = max(0, int(roi["core_x0"]))
+            cx1 = min(int(roi["core_x1"]), lw, fw)
+            if ct1 <= ct0 or cy1 <= cy0 or cx1 <= cx0:
+                logger.warning(
+                    "[Hybrid ROI] step=%s roi#%s: skip paste (full), empty slice ct=[%s,%s) cy=[%s,%s) cx=[%s,%s)",
+                    step_idx, roi_idx, ct0, ct1, cy0, cy1, cx0, cx1,
+                )
+                return
+            noise_fused[:, :, ct0:ct1, cy0:cy1, cx0:cx1] = noise_large[:, :, ct0:ct1, cy0:cy1, cx0:cx1]
+            return
+
+        lt0 = max(0, int(roi["local_core_t0"]))
+        lt1 = min(int(roi["local_core_t1"]), lf)
+        ly0 = max(0, int(roi["local_core_y0"]))
+        ly1 = min(int(roi["local_core_y1"]), lh)
+        lx0 = max(0, int(roi["local_core_x0"]))
+        lx1 = min(int(roi["local_core_x1"]), lw)
+
+        src = noise_large[:, :, lt0:lt1, ly0:ly1, lx0:lx1]
+        st, sy, sx = src.shape[2], src.shape[3], src.shape[4]
+
+        ct0 = max(0, int(roi["core_t0"]))
+        cy0 = max(0, int(roi["core_y0"]))
+        cx0 = max(0, int(roi["core_x0"]))
+
+        st = min(st, ff - ct0)
+        sy = min(sy, fh - cy0)
+        sx = min(sx, fw - cx0)
+        if st <= 0 or sy <= 0 or sx <= 0:
+            logger.warning(
+                "[Hybrid ROI] step=%s roi#%s: skip paste (crop), non-positive st/sy/sx=%s/%s/%s",
+                step_idx, roi_idx, st, sy, sx,
+            )
+            return
+
+        src = src[:, :, :st, :sy, :sx]
+        exp_t = int(roi["core_t1"]) - int(roi["core_t0"])
+        exp_y = int(roi["core_y1"]) - int(roi["core_y0"])
+        exp_x = int(roi["core_x1"]) - int(roi["core_x0"])
+        if st < exp_t or sy < exp_y or sx < exp_x:
+            logger.warning(
+                "[Hybrid ROI] step=%s roi#%s: core paste clipped (expect T,H,W=%s,%s,%s got %s,%s,%s); "
+                "outer may not fully cover core after align",
+                step_idx, roi_idx, exp_t, exp_y, exp_x, st, sy, sx,
+            )
+
+        noise_fused[:, :, ct0 : ct0 + st, cy0 : cy0 + sy, cx0 : cx0 + sx] = src
 
     def _run_hybrid_roi_refine(
         self,
@@ -508,19 +613,14 @@ class HybridWanPipeline(WanPipeline):
                 total_large_cond += large_cond
                 total_large_cfg += large_cfg
 
-                noise_fused[
-                    :,
-                    :,
-                    roi["core_t0"]:roi["core_t1"],
-                    roi["core_y0"]:roi["core_y1"],
-                    roi["core_x0"]:roi["core_x1"],
-                ] = noise_large_crop[
-                    :,
-                    :,
-                    roi["local_core_t0"]:roi["local_core_t1"],
-                    roi["local_core_y0"]:roi["local_core_y1"],
-                    roi["local_core_x0"]:roi["local_core_x1"],
-                ]
+                self._paste_large_into_fused_core(
+                    noise_fused,
+                    noise_large_crop,
+                    roi,
+                    use_local_indices=True,
+                    step_idx=step_idx,
+                    roi_idx=roi_idx,
+                )
 
                 crop_debug.append({
                     "roi_idx": roi_idx,

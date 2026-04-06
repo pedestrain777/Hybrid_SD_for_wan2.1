@@ -218,6 +218,10 @@ class Args:
         self.hybrid_smooth_iou_thresh = 0.25
         self.hybrid_smooth_momentum = 0.6
 
+        self.hybrid_use_tube_spatial = True
+        self.hybrid_tube_link_iou_thresh = 0.15
+        self.hybrid_tube_debug_max_frames = 8
+
         self.hybrid_debug_every = 1
         self.hybrid_debug_topk_frames = 5
         self.hybrid_debug_save_dir = str(

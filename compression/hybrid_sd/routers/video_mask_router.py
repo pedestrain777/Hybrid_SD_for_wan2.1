@@ -45,6 +45,63 @@ def _bbox_area(bbox: Tuple[int, int, int, int]) -> int:
     return max(0, y1 - y0) * max(0, x1 - x0)
 
 
+def _bbox_iou_2d(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> float:
+    ay0, ay1, ax0, ax1 = a
+    by0, by1, bx0, bx1 = b
+    iy = max(0, min(ay1, by1) - max(ay0, by0))
+    ix = max(0, min(ax1, bx1) - max(ax0, bx0))
+    inter = iy * ix
+    if inter <= 0:
+        return 0.0
+    ua = _bbox_area(a) + _bbox_area(b) - inter
+    return inter / max(1, ua)
+
+
+def _union_bboxes(bbs: List[Tuple[int, int, int, int]]) -> Tuple[int, int, int, int]:
+    y0 = min(b[0] for b in bbs)
+    y1 = max(b[1] for b in bbs)
+    x0 = min(b[2] for b in bbs)
+    x1 = max(b[3] for b in bbs)
+    return y0, y1, x0, x1
+
+
+def _temporal_topq_mean(x: torch.Tensor, top_ratio: float) -> torch.Tensor:
+    """x: [B,T,H,W] -> temporal score [B,T]：每帧取空间 top-q 像素均值。"""
+    b, t, h, w = x.shape
+    flat = x.reshape(b, t, -1)
+    hw = flat.shape[2]
+    k = max(1, int(math.ceil(hw * float(top_ratio))))
+    vals, _ = torch.topk(flat, k=k, dim=2)
+    return vals.mean(dim=2)
+
+
+def _compute_warp_residual(latents: torch.Tensor, max_shift: int) -> torch.Tensor:
+    """
+    便宜 warp：对 z_{t-1} 做整数平移搜索，使与 z_t 的 L1 最小；残差 |z_t - W(z_{t-1})| 通道均值。
+    latents [B,C,T,H,W] -> [B,T,H,W]
+    """
+    b, c, t, h, w = latents.shape
+    out = torch.zeros(b, t, h, w, device=latents.device, dtype=torch.float32)
+    if t <= 1:
+        return out
+    shifts = list(range(-max_shift, max_shift + 1))
+    for ti in range(1, t):
+        prev = latents[:, :, ti - 1]
+        curr = latents[:, :, ti]
+        best: Optional[torch.Tensor] = None
+        for dy in shifts:
+            for dx in shifts:
+                rolled = torch.roll(prev, shifts=(dy, dx), dims=(2, 3))
+                res = (curr - rolled).abs().mean(dim=1)
+                m = float(res.mean().item())
+                if best is None or m < best[0]:
+                    best = (m, res)
+        assert best is not None
+        out[:, ti] = best[1]
+    out[:, 0] = out[:, 1]
+    return out
+
+
 def _expand_align_bounds(
     start: int, end: int, limit: int, margin: int, min_size: int, align: int
 ) -> Tuple[int, int]:
@@ -191,7 +248,8 @@ def _bbox_from_projection_mass(
 
 class VideoMaskRouter:
     """
-    step_diff + small-CFG-gap + optional large-small gap + motion 融合；多连通域 -> 多 ROI + NMS。
+    step_diff + cfg_gap + ls_gap +（可选）motion / warp + 轨迹曲率/翻转；
+    时域 top-q 池化；空域可选 tube（逐帧 CC + IoU 链）替代段均值大框。
     """
 
     def __init__(self, config: Optional[Dict[str, Any]] = None):
@@ -202,11 +260,18 @@ class VideoMaskRouter:
             "step_diff_weight": 1.0,
             "cfg_gap_weight": 0.8,
             "ls_gap_weight": 0.8,
-            "motion_weight": 0.5,
+            "motion_weight": 0.0,
+            "warp_weight": 0.5,
+            "traj_curv_weight": 0.5,
+            "traj_flip_weight": 0.3,
+            "use_warp_cue": True,
+            "warp_max_shift": 2,
             "ls_gap_every": 2,
             "force_ls_gap_first": True,
             "motion_blur_kernel": 3,
             "temporal_top_ratio": 0.15,
+            "temporal_topq_ratio": 0.10,
+            "temporal_pool": "topq",
             "temporal_dilate": 1,
             "max_segments": 2,
             "spatial_top_ratio": 0.08,
@@ -235,6 +300,9 @@ class VideoMaskRouter:
             "debug_every": 1,
             "debug_topk_frames": 5,
             "save_debug_dir": None,
+            "use_tube_spatial": True,
+            "tube_link_iou_thresh": 0.15,
+            "tube_debug_max_frames": 8,
         }
 
         if config is not None:
@@ -248,9 +316,13 @@ class VideoMaskRouter:
 
     def reset(self):
         self.score_ema: Optional[torch.Tensor] = None
+        self.traj_curv_ema: Optional[torch.Tensor] = None
+        self.traj_flip_ema: Optional[torch.Tensor] = None
         self.cfg_gap_ema: Optional[torch.Tensor] = None
         self.ls_gap_ema: Optional[torch.Tensor] = None
         self.motion_ema: Optional[torch.Tensor] = None
+        self.warp_ema: Optional[torch.Tensor] = None
+        self._prev_latents_delta: Optional[torch.Tensor] = None
         self.prev_rois: List[Dict[str, Any]] = []
         self.last_ls_gap_step: int = -10**9
 
@@ -299,11 +371,40 @@ class VideoMaskRouter:
     def observe(self, latents_before: torch.Tensor, latents_after: torch.Tensor, step_idx: int) -> torch.Tensor:
         new_score = self.compute_diff_map(latents_before, latents_after)
 
+        alpha = float(self.config.get("ema_alpha", 0.85))
         if self.score_ema is None:
             self.score_ema = new_score
         else:
-            alpha = float(self.config.get("ema_alpha", 0.85))
             self.score_ema = alpha * self.score_ema + (1.0 - alpha) * new_score
+
+        raw_delta = (latents_before - latents_after).float()
+        b, c, t, h, w = raw_delta.shape
+        zero_like = torch.zeros(b, t, h, w, device=raw_delta.device, dtype=torch.float32)
+        prev = self._prev_latents_delta
+        if prev is None or prev.shape != raw_delta.shape:
+            curv_map = zero_like
+            flip_map = zero_like
+        else:
+            dcur = raw_delta - prev
+            curv_map = dcur.abs().mean(dim=1)
+            a = raw_delta
+            b_ = prev
+            cos_map = (a * b_).sum(dim=1) / (
+                a.norm(dim=1).clamp_min(1e-6) * b_.norm(dim=1).clamp_min(1e-6)
+            )
+            flip_map = (1.0 - cos_map.clamp(-1.0, 1.0)).clamp_min(0.0)
+
+        self._prev_latents_delta = raw_delta.detach()
+
+        if self.traj_curv_ema is None:
+            self.traj_curv_ema = curv_map
+        else:
+            self.traj_curv_ema = alpha * self.traj_curv_ema + (1.0 - alpha) * curv_map
+
+        if self.traj_flip_ema is None:
+            self.traj_flip_ema = flip_map
+        else:
+            self.traj_flip_ema = alpha * self.traj_flip_ema + (1.0 - alpha) * flip_map
 
         return self.score_ema
 
@@ -328,11 +429,27 @@ class VideoMaskRouter:
     ):
         alpha = float(self.config.get("aux_ema_alpha", 0.70))
 
-        motion_map = self.compute_motion_map(latents)
-        if self.motion_ema is None:
-            self.motion_ema = motion_map
+        use_warp = bool(self.config.get("use_warp_cue", True)) and float(
+            self.config.get("warp_weight", 0.0)
+        ) > 0.0
+        if use_warp:
+            max_shift = int(self.config.get("warp_max_shift", 2))
+            warp_map = _compute_warp_residual(latents, max_shift)
+            if self.warp_ema is None:
+                self.warp_ema = warp_map
+            else:
+                self.warp_ema = alpha * self.warp_ema + (1.0 - alpha) * warp_map
         else:
-            self.motion_ema = alpha * self.motion_ema + (1.0 - alpha) * motion_map
+            self.warp_ema = None
+
+        if float(self.config.get("motion_weight", 0.0)) > 0.0:
+            motion_map = self.compute_motion_map(latents)
+            if self.motion_ema is None:
+                self.motion_ema = motion_map
+            else:
+                self.motion_ema = alpha * self.motion_ema + (1.0 - alpha) * motion_map
+        else:
+            self.motion_ema = None
 
         if cfg_gap_map is not None:
             cfg_gap_map = cfg_gap_map.float()
@@ -355,13 +472,19 @@ class VideoMaskRouter:
             "cfg_gap": _normalize_map_per_sample(self.cfg_gap_ema),
             "ls_gap": _normalize_map_per_sample(self.ls_gap_ema),
             "motion": _normalize_map_per_sample(self.motion_ema),
+            "warp": _normalize_map_per_sample(self.warp_ema),
+            "traj_curv": _normalize_map_per_sample(self.traj_curv_ema),
+            "traj_flip": _normalize_map_per_sample(self.traj_flip_ema),
         }
 
         weights = {
             "step_diff": float(self.config.get("step_diff_weight", 1.0)),
             "cfg_gap": float(self.config.get("cfg_gap_weight", 0.8)),
             "ls_gap": float(self.config.get("ls_gap_weight", 0.8)),
-            "motion": float(self.config.get("motion_weight", 0.5)),
+            "motion": float(self.config.get("motion_weight", 0.0)),
+            "warp": float(self.config.get("warp_weight", 0.5)),
+            "traj_curv": float(self.config.get("traj_curv_weight", 0.5)),
+            "traj_flip": float(self.config.get("traj_flip_weight", 0.3)),
         }
 
         combined: Optional[torch.Tensor] = None
@@ -380,6 +503,8 @@ class VideoMaskRouter:
                 combined = torch.zeros_like(self.score_ema)
             elif self.cfg_gap_ema is not None:
                 combined = torch.zeros_like(self.cfg_gap_ema)
+            elif self.warp_ema is not None:
+                combined = torch.zeros_like(self.warp_ema)
             elif self.motion_ema is not None:
                 combined = torch.zeros_like(self.motion_ema)
             else:
@@ -389,6 +514,80 @@ class VideoMaskRouter:
         combined = combined / max(wsum, 1e-6)
         cues["combined"] = combined
         return cues
+
+    def _frame_best_component_bbox(
+        self,
+        spatial_2d: torch.Tensor,
+        full_area: int,
+    ) -> Tuple[Optional[Tuple[int, int, int, int]], float, List[Dict[str, Any]]]:
+        spatial_score_blur = _smooth2d(
+            spatial_2d.float(),
+            int(self.config["spatial_blur_kernel"]),
+        )
+        smin = float(spatial_score_blur.min().item())
+        smax = float(spatial_score_blur.max().item())
+        spatial_score_norm = (spatial_score_blur - smin) / max(1e-6, (smax - smin))
+
+        seed_topk = _topk_binary_mask(
+            spatial_score_norm.unsqueeze(0),
+            ratio=float(self.config["spatial_top_ratio"]),
+        )[0]
+
+        peak_ratio = float(self.config["spatial_peak_ratio"])
+        maxv = float(spatial_score_norm.max().item())
+        peak_gate = spatial_score_norm >= (peak_ratio * maxv) if maxv > 0 else spatial_score_norm > 0
+
+        seed_mask = seed_topk & peak_gate
+        if seed_mask.sum().item() == 0:
+            seed_mask = seed_topk
+
+        dilate_hw = int(self.config["spatial_dilate"])
+        if dilate_hw > 0:
+            seed_mask = F.max_pool2d(
+                seed_mask.float().unsqueeze(0).unsqueeze(0),
+                kernel_size=2 * dilate_hw + 1,
+                stride=1,
+                padding=dilate_hw,
+            ).squeeze(0).squeeze(0) > 0
+
+        comps = _extract_connected_components(
+            seed_mask,
+            min_area=int(self.config["spatial_cc_min_area"]),
+        )
+
+        min_ratio = float(self.config["spatial_min_bbox_ratio"])
+        max_ratio = float(self.config["spatial_max_bbox_ratio"])
+
+        comp_infos: List[Dict[str, Any]] = []
+        best_bbox: Optional[Tuple[int, int, int, int]] = None
+        best_sum = 0.0
+
+        for comp_id, comp in enumerate(comps):
+            bbox = comp["bbox"]
+            if bbox is None:
+                continue
+            area_ratio = _bbox_area(bbox) / full_area
+            mask = comp["mask"]
+
+            score_mean = float(spatial_score_norm[mask].mean().item()) if mask.any() else 0.0
+            score_sum = float(spatial_score_norm[mask].sum().item()) if mask.any() else 0.0
+
+            valid = bool(min_ratio <= area_ratio <= max_ratio)
+            comp_infos.append({
+                "comp_id": comp_id,
+                "bbox": list(bbox),
+                "pixels": int(comp["pixels"]),
+                "bbox_area_ratio": float(area_ratio),
+                "score_mean": score_mean,
+                "score_sum": score_sum,
+                "valid": valid,
+            })
+
+            if valid and score_sum > best_sum:
+                best_sum = score_sum
+                best_bbox = bbox
+
+        return best_bbox, float(best_sum), comp_infos
 
     def _make_roi(
         self,
@@ -503,7 +702,14 @@ class VideoMaskRouter:
         assert combined is not None
         full_area = max(1, h * w)
 
-        temporal_score = combined.mean(dim=(2, 3))
+        temporal_pool = str(self.config.get("temporal_pool", "topq")).lower()
+        if temporal_pool == "mean":
+            temporal_score = combined.mean(dim=(2, 3))
+        else:
+            temporal_score = _temporal_topq_mean(
+                combined,
+                float(self.config.get("temporal_topq_ratio", 0.10)),
+            )
         temporal_mask = _topk_binary_mask(
             temporal_score,
             ratio=float(self.config["temporal_top_ratio"]),
@@ -532,118 +738,227 @@ class VideoMaskRouter:
         spatial_debug: List[Dict[str, Any]] = []
         debug_tensors: Dict[str, Any] = {}
 
+        use_tube = bool(self.config.get("use_tube_spatial", True))
+        tube_iou = float(self.config.get("tube_link_iou_thresh", 0.15))
+        max_dbg_frames = int(self.config.get("tube_debug_max_frames", 8))
+
         for seg_rank, (seg_score, s, e) in enumerate(segment_scores):
             spatial_score_raw = combined[0, s:e].mean(dim=0)
             spatial_score_blur = _smooth2d(
                 spatial_score_raw,
-                int(self.config["spatial_blur_kernel"])
+                int(self.config["spatial_blur_kernel"]),
             )
-
             smin = float(spatial_score_blur.min().item())
             smax = float(spatial_score_blur.max().item())
             spatial_score_norm = (spatial_score_blur - smin) / max(1e-6, (smax - smin))
 
-            seed_topk = _topk_binary_mask(
-                spatial_score_norm.unsqueeze(0),
-                ratio=float(self.config["spatial_top_ratio"]),
-            )[0]
-
-            peak_ratio = float(self.config["spatial_peak_ratio"])
-            peak_gate = spatial_score_norm >= (peak_ratio * float(spatial_score_norm.max().item()))
-
-            seed_mask = seed_topk & peak_gate
-            if seed_mask.sum().item() == 0:
-                seed_mask = seed_topk
-
-            dilate_hw = int(self.config["spatial_dilate"])
-            if dilate_hw > 0:
-                seed_mask = F.max_pool2d(
-                    seed_mask.float().unsqueeze(0).unsqueeze(0),
-                    kernel_size=2 * dilate_hw + 1,
-                    stride=1,
-                    padding=dilate_hw,
-                ).squeeze(0).squeeze(0) > 0
-
-            comps = _extract_connected_components(
-                seed_mask,
-                min_area=int(self.config["spatial_cc_min_area"]),
-            )
-
-            comp_infos = []
-            valid_comp_count = 0
-
-            min_ratio = float(self.config["spatial_min_bbox_ratio"])
-            max_ratio = float(self.config["spatial_max_bbox_ratio"])
-
-            for comp_id, comp in enumerate(comps):
-                bbox = comp["bbox"]
-                if bbox is None:
-                    continue
-                area_ratio = _bbox_area(bbox) / full_area
-                mask = comp["mask"]
-
-                score_mean = float(spatial_score_norm[mask].mean().item()) if mask.any() else 0.0
-                score_sum = float(spatial_score_norm[mask].sum().item()) if mask.any() else 0.0
-
-                comp_infos.append({
-                    "comp_id": comp_id,
-                    "bbox": list(bbox),
-                    "pixels": int(comp["pixels"]),
-                    "bbox_area_ratio": float(area_ratio),
-                    "score_mean": score_mean,
-                    "score_sum": score_sum,
-                    "valid": bool(min_ratio <= area_ratio <= max_ratio),
-                })
-
-                if min_ratio <= area_ratio <= max_ratio:
-                    valid_comp_count += 1
-                    y0, y1, x0, x1 = bbox
-                    roi = self._make_roi(
-                        t_len, h, w,
-                        s, e,
-                        y0, y1, x0, x1
-                    )
-                    roi["seg_rank"] = seg_rank
-                    roi["seg_score"] = seg_score
-                    roi["comp_score"] = score_sum
-                    roi["bbox_source"] = "multi_cc"
-                    candidates.append(roi)
-
-            proj_bbox = _bbox_from_projection_mass(
-                spatial_score_norm,
-                keep_ratio_h=float(self.config["projection_keep_ratio_h"]),
-                keep_ratio_w=float(self.config["projection_keep_ratio_w"]),
-                blur_kernel=int(self.config["projection_blur_kernel"]),
-            )
-            proj_area_ratio = _bbox_area(proj_bbox) / full_area
-
-            if valid_comp_count == 0:
-                y0, y1, x0, x1 = proj_bbox
-                roi = self._make_roi(
-                    t_len, h, w,
-                    s, e,
-                    y0, y1, x0, x1
-                )
-                roi["seg_rank"] = seg_rank
-                roi["seg_score"] = seg_score
-                roi["comp_score"] = float(spatial_score_norm[y0:y1, x0:x1].mean().item())
-                roi["bbox_source"] = "projection_fallback_no_valid_cc"
-                candidates.append(roi)
-
-            spatial_debug.append({
+            seg_entry: Dict[str, Any] = {
                 "segment": [s, e],
                 "seg_score": seg_score,
-                "num_components_total": len(comps),
-                "num_components_valid": valid_comp_count,
-                "proj_bbox": list(proj_bbox),
-                "proj_area_ratio": float(proj_area_ratio),
-                "components": comp_infos,
-            })
+                "temporal_pool": temporal_pool,
+            }
+
+            if use_tube and (e - s) >= 1:
+                seg_entry["spatial_routing"] = "tube"
+                records: List[Tuple[int, Optional[Tuple[int, int, int, int]], float, List[Dict[str, Any]]]] = []
+                for t in range(s, e):
+                    bb, sc_sum, finfos = self._frame_best_component_bbox(combined[0, t], full_area)
+                    records.append((t, bb, sc_sum, finfos))
+
+                chains: List[List[Tuple[int, Optional[Tuple[int, int, int, int]], float, List[Dict[str, Any]]]]] = []
+                cur_chain: List[Tuple[int, Optional[Tuple[int, int, int, int]], float, List[Dict[str, Any]]]] = []
+                prev_bb: Optional[Tuple[int, int, int, int]] = None
+                for t, bb, sc_sum, finfos in records:
+                    if bb is None:
+                        if cur_chain:
+                            chains.append(cur_chain)
+                            cur_chain = []
+                        prev_bb = None
+                        continue
+                    if prev_bb is None:
+                        cur_chain = [(t, bb, sc_sum, finfos)]
+                    else:
+                        if _bbox_iou_2d(prev_bb, bb) >= tube_iou:
+                            cur_chain.append((t, bb, sc_sum, finfos))
+                        else:
+                            if cur_chain:
+                                chains.append(cur_chain)
+                            cur_chain = [(t, bb, sc_sum, finfos)]
+                    prev_bb = bb
+                if cur_chain:
+                    chains.append(cur_chain)
+
+                min_ratio = float(self.config["spatial_min_bbox_ratio"])
+                max_ratio = float(self.config["spatial_max_bbox_ratio"])
+                tube_summaries: List[Dict[str, Any]] = []
+                valid_tube_rois = 0
+
+                for ci, chain in enumerate(chains):
+                    bbs = [c[1] for c in chain if c[1] is not None]
+                    if not bbs:
+                        continue
+                    u = _union_bboxes(bbs)
+                    u_ratio = _bbox_area(u) / full_area
+                    comp_score = float(sum(c[2] for c in chain))
+                    tube_summaries.append({
+                        "chain_id": ci,
+                        "frames": [int(c[0]) for c in chain],
+                        "union_bbox": list(u),
+                        "union_area_ratio": float(u_ratio),
+                        "comp_score_sum": comp_score,
+                        "valid_union": bool(min_ratio <= u_ratio <= max_ratio),
+                    })
+                    if min_ratio <= u_ratio <= max_ratio:
+                        valid_tube_rois += 1
+                        y0, y1, x0, x1 = u
+                        roi = self._make_roi(t_len, h, w, s, e, y0, y1, x0, x1)
+                        roi["seg_rank"] = seg_rank
+                        roi["seg_score"] = seg_score
+                        roi["comp_score"] = comp_score
+                        roi["bbox_source"] = "tube_union"
+                        roi["tube_chain_id"] = ci
+                        candidates.append(roi)
+
+                per_frame_dbg: List[Dict[str, Any]] = []
+                for t, bb, sc_sum, finfos in records[:max_dbg_frames]:
+                    per_frame_dbg.append({
+                        "t": int(t),
+                        "bbox": None if bb is None else list(bb),
+                        "best_score_sum": float(sc_sum),
+                        "num_components": len(finfos),
+                    })
+
+                seg_entry.update({
+                    "num_tube_chains": len(chains),
+                    "tube_chain_summaries": tube_summaries,
+                    "per_frame_top_bbox_preview": per_frame_dbg,
+                    "num_tube_rois_valid": valid_tube_rois,
+                })
+
+                if valid_tube_rois == 0:
+                    proj_bbox = _bbox_from_projection_mass(
+                        spatial_score_norm,
+                        keep_ratio_h=float(self.config["projection_keep_ratio_h"]),
+                        keep_ratio_w=float(self.config["projection_keep_ratio_w"]),
+                        blur_kernel=int(self.config["projection_blur_kernel"]),
+                    )
+                    y0, y1, x0, x1 = proj_bbox
+                    roi = self._make_roi(t_len, h, w, s, e, y0, y1, x0, x1)
+                    roi["seg_rank"] = seg_rank
+                    roi["seg_score"] = seg_score
+                    roi["comp_score"] = float(spatial_score_norm[y0:y1, x0:x1].mean().item())
+                    roi["bbox_source"] = "tube_fallback_projection"
+                    candidates.append(roi)
+                    seg_entry["tube_fallback"] = "projection"
+
+                flat_comps: List[Dict[str, Any]] = []
+                for t, bb, sc_sum, finfos in records:
+                    for fi in finfos:
+                        fc = dict(fi)
+                        fc["frame_t"] = int(t)
+                        flat_comps.append(fc)
+                seg_entry["num_components_total"] = len(flat_comps)
+                seg_entry["num_components_valid"] = sum(1 for x in flat_comps if x.get("valid"))
+                seg_entry["proj_bbox"] = list(
+                    _bbox_from_projection_mass(
+                        spatial_score_norm,
+                        keep_ratio_h=float(self.config["projection_keep_ratio_h"]),
+                        keep_ratio_w=float(self.config["projection_keep_ratio_w"]),
+                        blur_kernel=int(self.config["projection_blur_kernel"]),
+                    )
+                )
+                seg_entry["proj_area_ratio"] = float(_bbox_area(tuple(seg_entry["proj_bbox"])) / full_area)
+                seg_entry["components"] = flat_comps[:48]
+
+                spatial_debug.append(seg_entry)
+                debug_tensors[f"seg{seg_rank}_segment_combined_stack"] = combined[0, s:e].detach().cpu()
+            else:
+                seg_entry["spatial_routing"] = "segment_mean"
+                seed_topk = _topk_binary_mask(
+                    spatial_score_norm.unsqueeze(0),
+                    ratio=float(self.config["spatial_top_ratio"]),
+                )[0]
+                peak_ratio = float(self.config["spatial_peak_ratio"])
+                peak_gate = spatial_score_norm >= (peak_ratio * float(spatial_score_norm.max().item()))
+                seed_mask = seed_topk & peak_gate
+                if seed_mask.sum().item() == 0:
+                    seed_mask = seed_topk
+                dilate_hw = int(self.config["spatial_dilate"])
+                if dilate_hw > 0:
+                    seed_mask = F.max_pool2d(
+                        seed_mask.float().unsqueeze(0).unsqueeze(0),
+                        kernel_size=2 * dilate_hw + 1,
+                        stride=1,
+                        padding=dilate_hw,
+                    ).squeeze(0).squeeze(0) > 0
+
+                comps = _extract_connected_components(
+                    seed_mask,
+                    min_area=int(self.config["spatial_cc_min_area"]),
+                )
+
+                comp_infos = []
+                valid_comp_count = 0
+                min_ratio = float(self.config["spatial_min_bbox_ratio"])
+                max_ratio = float(self.config["spatial_max_bbox_ratio"])
+
+                for comp_id, comp in enumerate(comps):
+                    bbox = comp["bbox"]
+                    if bbox is None:
+                        continue
+                    area_ratio = _bbox_area(bbox) / full_area
+                    mask = comp["mask"]
+                    score_mean = float(spatial_score_norm[mask].mean().item()) if mask.any() else 0.0
+                    score_sum = float(spatial_score_norm[mask].sum().item()) if mask.any() else 0.0
+                    comp_infos.append({
+                        "comp_id": comp_id,
+                        "bbox": list(bbox),
+                        "pixels": int(comp["pixels"]),
+                        "bbox_area_ratio": float(area_ratio),
+                        "score_mean": score_mean,
+                        "score_sum": score_sum,
+                        "valid": bool(min_ratio <= area_ratio <= max_ratio),
+                    })
+                    if min_ratio <= area_ratio <= max_ratio:
+                        valid_comp_count += 1
+                        y0, y1, x0, x1 = bbox
+                        roi = self._make_roi(t_len, h, w, s, e, y0, y1, x0, x1)
+                        roi["seg_rank"] = seg_rank
+                        roi["seg_score"] = seg_score
+                        roi["comp_score"] = score_sum
+                        roi["bbox_source"] = "multi_cc"
+                        candidates.append(roi)
+
+                proj_bbox = _bbox_from_projection_mass(
+                    spatial_score_norm,
+                    keep_ratio_h=float(self.config["projection_keep_ratio_h"]),
+                    keep_ratio_w=float(self.config["projection_keep_ratio_w"]),
+                    blur_kernel=int(self.config["projection_blur_kernel"]),
+                )
+                proj_area_ratio = _bbox_area(proj_bbox) / full_area
+
+                if valid_comp_count == 0:
+                    y0, y1, x0, x1 = proj_bbox
+                    roi = self._make_roi(t_len, h, w, s, e, y0, y1, x0, x1)
+                    roi["seg_rank"] = seg_rank
+                    roi["seg_score"] = seg_score
+                    roi["comp_score"] = float(spatial_score_norm[y0:y1, x0:x1].mean().item())
+                    roi["bbox_source"] = "projection_fallback_no_valid_cc"
+                    candidates.append(roi)
+
+                seg_entry.update({
+                    "num_components_total": len(comps),
+                    "num_components_valid": valid_comp_count,
+                    "proj_bbox": list(proj_bbox),
+                    "proj_area_ratio": float(proj_area_ratio),
+                    "components": comp_infos,
+                })
+                spatial_debug.append(seg_entry)
+                debug_tensors[f"seg{seg_rank}_seed_mask"] = seed_mask.detach().cpu()
 
             debug_tensors[f"seg{seg_rank}_spatial_score_raw"] = spatial_score_raw.detach().cpu()
             debug_tensors[f"seg{seg_rank}_spatial_score_blur"] = spatial_score_blur.detach().cpu()
             debug_tensors[f"seg{seg_rank}_spatial_score_norm"] = spatial_score_norm.detach().cpu()
-            debug_tensors[f"seg{seg_rank}_seed_mask"] = seed_mask.detach().cpu()
 
         if len(candidates) == 0:
             full_roi = self._make_roi(t_len, h, w, 0, t_len, 0, h, 0, w)
@@ -704,9 +1019,14 @@ class VideoMaskRouter:
         )
         full_volume = max(1, t_len * h * w)
 
+        cue_keys = ["step_diff", "cfg_gap", "ls_gap", "motion", "warp", "traj_curv", "traj_flip"]
         debug = {
             "step_idx": step_idx,
             "router_warm_start": False,
+            "temporal_pool": temporal_pool,
+            "temporal_topq_ratio": float(self.config.get("temporal_topq_ratio", 0.10)),
+            "use_tube_spatial": bool(self.config.get("use_tube_spatial", True)),
+            "tube_link_iou_thresh": float(self.config.get("tube_link_iou_thresh", 0.15)),
             "score_mean": float(combined.mean().item()),
             "score_std": float(combined.std().item()),
             "score_max": float(combined.max().item()),
@@ -714,11 +1034,14 @@ class VideoMaskRouter:
                 "step_diff": float(self.config.get("step_diff_weight", 1.0)),
                 "cfg_gap": float(self.config.get("cfg_gap_weight", 0.8)),
                 "ls_gap": float(self.config.get("ls_gap_weight", 0.8)),
-                "motion": float(self.config.get("motion_weight", 0.5)),
+                "motion": float(self.config.get("motion_weight", 0.0)),
+                "warp": float(self.config.get("warp_weight", 0.5)),
+                "traj_curv": float(self.config.get("traj_curv_weight", 0.5)),
+                "traj_flip": float(self.config.get("traj_flip_weight", 0.3)),
             },
             "cue_means": {
                 name: (None if cue_maps.get(name) is None else float(cue_maps[name].mean().item()))
-                for name in ["step_diff", "cfg_gap", "ls_gap", "motion"]
+                for name in cue_keys
             },
             "ls_gap_last_step": int(self.last_ls_gap_step),
             "temporal_top_frames": top_idx.tolist(),
@@ -737,9 +1060,12 @@ class VideoMaskRouter:
 
             save_payload: Dict[str, Any] = {
                 "step_diff_ema": None if self.score_ema is None else self.score_ema.detach().cpu(),
+                "traj_curv_ema": None if self.traj_curv_ema is None else self.traj_curv_ema.detach().cpu(),
+                "traj_flip_ema": None if self.traj_flip_ema is None else self.traj_flip_ema.detach().cpu(),
                 "cfg_gap_ema": None if self.cfg_gap_ema is None else self.cfg_gap_ema.detach().cpu(),
                 "ls_gap_ema": None if self.ls_gap_ema is None else self.ls_gap_ema.detach().cpu(),
                 "motion_ema": None if self.motion_ema is None else self.motion_ema.detach().cpu(),
+                "warp_ema": None if self.warp_ema is None else self.warp_ema.detach().cpu(),
                 "combined_score": combined.detach().cpu(),
                 "temporal_score": temporal_score.detach().cpu(),
                 "temporal_mask": temporal_mask.detach().cpu(),

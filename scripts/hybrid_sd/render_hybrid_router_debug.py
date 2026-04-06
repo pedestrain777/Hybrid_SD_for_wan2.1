@@ -90,7 +90,15 @@ def render_step(step_file: Path, out_dir: Path, max_frames: int = 4):
     temporal_score = payload["temporal_score"][0]
     temporal_mask = payload["temporal_mask"][0].float()
 
-    cue_names = ["step_diff", "cfg_gap", "motion", "ls_gap"]
+    cue_candidates = [
+        "step_diff", "cfg_gap", "ls_gap", "motion", "warp", "traj_curv", "traj_flip",
+    ]
+    cue_names = [n for n in cue_candidates if payload.get(n) is not None]
+    if not cue_names:
+        for n in ("combined", "step_diff"):
+            if payload.get(n) is not None:
+                cue_names = [n]
+                break
     cue_maps = {name: payload.get(name, None) for name in cue_names}
 
     frames = _frames_to_show(payload, debug, max_frames=max_frames)
@@ -118,8 +126,9 @@ def render_step(step_file: Path, out_dir: Path, max_frames: int = 4):
             fontsize=9,
         )
 
+    pool = debug.get("temporal_pool", "?")
     ax0.set_title(
-        f"step={step_idx} | temporal hard frames / segments | "
+        f"step={step_idx} | temporal_pool={pool} | hard frames / segments | "
         f"core_ratio={debug.get('core_ratio', 0.0):.4f} | "
         f"outer_ratio={debug.get('outer_ratio', 0.0):.4f}"
     )
