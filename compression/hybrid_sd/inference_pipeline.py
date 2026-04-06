@@ -837,23 +837,32 @@ class HybridVideoInferencePipeline:
             "ema_alpha": getattr(self.args, "hybrid_ema_alpha", 0.85),
             "aux_ema_alpha": getattr(self.args, "hybrid_aux_ema_alpha", 0.70),
             "relative_diff": getattr(self.args, "hybrid_relative_diff", True),
+
+            # 只保留 4 个有效 cue
             "step_diff_weight": getattr(self.args, "hybrid_step_diff_weight", 1.0),
             "cfg_gap_weight": getattr(self.args, "hybrid_cfg_gap_weight", 0.8),
-            "ls_gap_weight": getattr(self.args, "hybrid_ls_gap_weight", 0.8),
-            "motion_weight": getattr(self.args, "hybrid_motion_weight", 0.0),
-            "warp_weight": getattr(self.args, "hybrid_warp_weight", 0.5),
-            "traj_curv_weight": getattr(self.args, "hybrid_traj_curv_weight", 0.5),
-            "traj_flip_weight": getattr(self.args, "hybrid_traj_flip_weight", 0.3),
+            "warp_weight": getattr(self.args, "hybrid_warp_weight", 0.8),
+            "traj_curv_weight": getattr(self.args, "hybrid_traj_curv_weight", 0.6),
+
+            # 默认全部关闭
+            "ls_gap_weight": 0.0,
+            "motion_weight": 0.0,
+            "traj_flip_weight": 0.0,
+
             "use_warp_cue": getattr(self.args, "hybrid_use_warp_cue", True),
             "warp_max_shift": getattr(self.args, "hybrid_warp_max_shift", 2),
-            "ls_gap_every": getattr(self.args, "hybrid_ls_gap_every", 2),
-            "force_ls_gap_first": getattr(self.args, "hybrid_force_ls_gap_first", True),
+
+            "ls_gap_every": 0,
+            "force_ls_gap_first": False,
+
             "motion_blur_kernel": getattr(self.args, "hybrid_motion_blur_kernel", 3),
+
             "temporal_top_ratio": getattr(self.args, "hybrid_temporal_top_ratio", 0.15),
             "temporal_topq_ratio": getattr(self.args, "hybrid_temporal_topq_ratio", 0.10),
             "temporal_pool": getattr(self.args, "hybrid_temporal_pool", "topq"),
             "temporal_dilate": getattr(self.args, "hybrid_temporal_dilate", 1),
             "max_segments": getattr(self.args, "hybrid_max_segments", 2),
+
             "spatial_top_ratio": getattr(self.args, "hybrid_spatial_top_ratio", 0.08),
             "spatial_dilate": getattr(self.args, "hybrid_spatial_dilate", 1),
             "spatial_blur_kernel": getattr(self.args, "hybrid_spatial_blur_kernel", 9),
@@ -861,25 +870,33 @@ class HybridVideoInferencePipeline:
             "spatial_cc_min_area": getattr(self.args, "hybrid_spatial_cc_min_area", 12),
             "spatial_min_bbox_ratio": getattr(self.args, "hybrid_spatial_min_bbox_ratio", 0.01),
             "spatial_max_bbox_ratio": getattr(self.args, "hybrid_spatial_max_bbox_ratio", 0.55),
+
             "max_rois_per_segment": getattr(self.args, "hybrid_max_rois_per_segment", 2),
             "max_total_rois": getattr(self.args, "hybrid_max_total_rois", 4),
             "roi_nms_iou_thresh": getattr(self.args, "hybrid_roi_nms_iou_thresh", 0.12),
+
             "projection_keep_ratio_h": getattr(self.args, "hybrid_projection_keep_ratio_h", 0.65),
             "projection_keep_ratio_w": getattr(self.args, "hybrid_projection_keep_ratio_w", 0.65),
             "projection_blur_kernel": getattr(self.args, "hybrid_projection_blur_kernel", 9),
+
             "margin_t": getattr(self.args, "hybrid_margin_t", 1),
             "margin_h": getattr(self.args, "hybrid_margin_h", 4),
             "margin_w": getattr(self.args, "hybrid_margin_w", 4),
+
             "min_crop_t": getattr(self.args, "hybrid_min_crop_t", 1),
             "min_crop_h": getattr(self.args, "hybrid_min_crop_h", 8),
             "min_crop_w": getattr(self.args, "hybrid_min_crop_w", 8),
+
             "align_h": getattr(self.args, "hybrid_align_h", 2),
             "align_w": getattr(self.args, "hybrid_align_w", 2),
+
             "smooth_iou_thresh": getattr(self.args, "hybrid_smooth_iou_thresh", 0.25),
             "smooth_momentum": getattr(self.args, "hybrid_smooth_momentum", 0.6),
+
             "debug_every": getattr(self.args, "hybrid_debug_every", 1),
             "debug_topk_frames": getattr(self.args, "hybrid_debug_topk_frames", 5),
             "save_debug_dir": getattr(self.args, "hybrid_debug_save_dir", None),
+
             "use_tube_spatial": getattr(self.args, "hybrid_use_tube_spatial", True),
             "tube_link_iou_thresh": getattr(self.args, "hybrid_tube_link_iou_thresh", 0.15),
             "tube_debug_max_frames": getattr(self.args, "hybrid_tube_debug_max_frames", 8),

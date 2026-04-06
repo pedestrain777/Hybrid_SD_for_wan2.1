@@ -123,23 +123,32 @@ class HybridWanPipeline(WanPipeline):
             "ema_alpha": 0.85,
             "aux_ema_alpha": 0.70,
             "relative_diff": True,
+
+            # 只保留 4 个有效 cue
             "step_diff_weight": 1.0,
             "cfg_gap_weight": 0.8,
-            "ls_gap_weight": 0.8,
+            "warp_weight": 0.8,
+            "traj_curv_weight": 0.6,
+
+            # 这些默认关闭
+            "ls_gap_weight": 0.0,
             "motion_weight": 0.0,
-            "warp_weight": 0.5,
-            "traj_curv_weight": 0.5,
-            "traj_flip_weight": 0.3,
+            "traj_flip_weight": 0.0,
+
             "use_warp_cue": True,
             "warp_max_shift": 2,
-            "ls_gap_every": 2,
-            "force_ls_gap_first": True,
+
+            "ls_gap_every": 0,
+            "force_ls_gap_first": False,
+
             "motion_blur_kernel": 3,
+
             "temporal_top_ratio": 0.15,
             "temporal_topq_ratio": 0.10,
             "temporal_pool": "topq",
             "temporal_dilate": 1,
             "max_segments": 2,
+
             "spatial_top_ratio": 0.08,
             "spatial_dilate": 1,
             "spatial_blur_kernel": 9,
@@ -147,25 +156,33 @@ class HybridWanPipeline(WanPipeline):
             "spatial_cc_min_area": 12,
             "spatial_min_bbox_ratio": 0.01,
             "spatial_max_bbox_ratio": 0.55,
+
             "max_rois_per_segment": 2,
             "max_total_rois": 4,
             "roi_nms_iou_thresh": 0.12,
+
             "projection_keep_ratio_h": 0.65,
             "projection_keep_ratio_w": 0.65,
             "projection_blur_kernel": 9,
+
             "margin_t": 1,
             "margin_h": 4,
             "margin_w": 4,
+
             "min_crop_t": 1,
             "min_crop_h": 8,
             "min_crop_w": 8,
+
             "align_h": 2,
             "align_w": 2,
+
             "smooth_iou_thresh": 0.25,
             "smooth_momentum": 0.6,
+
             "debug_every": 1,
             "debug_topk_frames": 5,
             "save_debug_dir": None,
+
             "use_tube_spatial": True,
             "tube_link_iou_thresh": 0.15,
             "tube_debug_max_frames": 8,
@@ -214,6 +231,34 @@ class HybridWanPipeline(WanPipeline):
         """兼容旧接口名，等同于 set_hybrid_roi_config。"""
         self.set_hybrid_roi_config(hybrid_mask_config)
 
+    def _sync_cuda_if_needed(self, *refs):
+        if not torch.cuda.is_available():
+            return
+
+        device = None
+        for ref in refs:
+            if isinstance(ref, torch.Tensor) and ref.is_cuda:
+                device = ref.device
+                break
+
+        if device is None:
+            dev = getattr(self, "_execution_device", None)
+            if isinstance(dev, str):
+                dev = torch.device(dev)
+            if isinstance(dev, torch.device) and dev.type == "cuda":
+                device = dev
+
+        if device is not None and torch.device(device).type == "cuda":
+            torch.cuda.synchronize(device)
+
+    def _perf_counter_sync(self, *refs) -> float:
+        self._sync_cuda_if_needed(*refs)
+        return time_module.perf_counter()
+
+    def _elapsed_sync(self, start_t: float, *refs) -> float:
+        self._sync_cuda_if_needed(*refs)
+        return time_module.perf_counter() - start_t
+
     def _reset_hybrid_state(self):
         if hasattr(self, "roi_router") and self.roi_router is not None:
             self.roi_router.reset()
@@ -232,7 +277,7 @@ class HybridWanPipeline(WanPipeline):
         attention_kwargs: Optional[Dict[str, Any]],
         return_aux: bool = False,
     ):
-        t0 = time_module.perf_counter()
+        t0 = self._perf_counter_sync(latent_model_input)
         noise_cond = transformer(
             hidden_states=latent_model_input,
             encoder_hidden_states=prompt_embeds,
@@ -240,7 +285,7 @@ class HybridWanPipeline(WanPipeline):
             attention_kwargs=attention_kwargs,
             return_dict=False,
         )[0]
-        cond_time = time_module.perf_counter() - t0
+        cond_time = self._elapsed_sync(t0, noise_cond)
 
         aux = {
             "noise_cond": noise_cond,
@@ -264,7 +309,7 @@ class HybridWanPipeline(WanPipeline):
                 return noise_cond, cond_time, uncond_time, aux
             return noise_cond, cond_time, uncond_time
 
-        t1 = time_module.perf_counter()
+        t1 = self._perf_counter_sync(latent_model_input)
         noise_uncond = transformer(
             hidden_states=latent_model_input,
             encoder_hidden_states=negative_prompt_embeds,
@@ -272,7 +317,7 @@ class HybridWanPipeline(WanPipeline):
             attention_kwargs=attention_kwargs,
             return_dict=False,
         )[0]
-        uncond_time = time_module.perf_counter() - t1
+        uncond_time = self._elapsed_sync(t1, noise_uncond)
 
         cur_guidance = guidance_scale
         if use_dynamic_cfg:
@@ -460,10 +505,10 @@ class HybridWanPipeline(WanPipeline):
         exp_y = int(roi["core_y1"]) - int(roi["core_y0"])
         exp_x = int(roi["core_x1"]) - int(roi["core_x0"])
         if st < exp_t or sy < exp_y or sx < exp_x:
-            logger.warning(
-                "[Hybrid ROI] step=%s roi#%s: core paste clipped (expect T,H,W=%s,%s,%s got %s,%s,%s); "
-                "outer may not fully cover core after align",
-                step_idx, roi_idx, exp_t, exp_y, exp_x, st, sy, sx,
+            raise RuntimeError(
+                f"[Hybrid ROI] step={step_idx} roi#{roi_idx}: core paste clipped "
+                f"(expect T,H,W={exp_t},{exp_y},{exp_x} got {st},{sy},{sx}). "
+                f"This indicates ROI geometry repair failed; outer no longer fully covers core."
             )
 
         noise_fused[:, :, ct0 : ct0 + st, cy0 : cy0 + sy, cx0 : cx0 + sx] = src
@@ -488,6 +533,7 @@ class HybridWanPipeline(WanPipeline):
         small 全图；可选 full-large 刷新 ls_gap；observe_aux 更新 cfg_gap/motion/ls_gap；
         组合 score 建多 ROI；large 回填 core（refresh 步复用同一步 full-large）。
         """
+        t_refine_start = self._perf_counter_sync(latent_model_input)
         noise_small, small_time_cond, small_time_cfg, small_aux = self._predict_noise_cfg(
             transformer=self.transformers[small_index],
             latent_model_input=latent_model_input,
@@ -544,7 +590,11 @@ class HybridWanPipeline(WanPipeline):
             step_idx=step_idx,
         )
 
+        t_router_start = self._perf_counter_sync(latents)
         rois, router_debug = self.roi_router.build_rois(latents.detach().float(), step_idx=step_idx)
+        router_build_time = self._elapsed_sync(t_router_start, latents)
+        router_debug.setdefault("timing", {})
+        router_debug["timing"]["router_build_time"] = router_build_time
         self._log_router_debug(step_idx, router_debug)
 
         noise_fused = noise_small.clone()
@@ -595,7 +645,7 @@ class HybridWanPipeline(WanPipeline):
                     print(f"[WARN] step={step_idx}, roi#{roi_idx} crop_input invalid: {tuple(crop_input.shape)}")
                     continue
 
-                t0_crop = time_module.perf_counter()
+                t0_crop = self._perf_counter_sync(crop_input)
                 noise_large_crop, large_cond, large_cfg = self._predict_noise_cfg(
                     transformer=self.transformers[large_index],
                     latent_model_input=crop_input,
@@ -608,7 +658,7 @@ class HybridWanPipeline(WanPipeline):
                     t=t,
                     attention_kwargs=attention_kwargs,
                 )
-                crop_time = time_module.perf_counter() - t0_crop
+                crop_time = self._elapsed_sync(t0_crop, noise_large_crop)
 
                 total_large_cond += large_cond
                 total_large_cfg += large_cfg
@@ -631,11 +681,17 @@ class HybridWanPipeline(WanPipeline):
                     "core_coords": (roi["core_t0"], roi["core_t1"], roi["core_y0"], roi["core_y1"], roi["core_x0"], roi["core_x1"]),
                 })
 
+        hybrid_total_time = self._elapsed_sync(t_refine_start, noise_fused)
+        router_debug.setdefault("timing", {})
+        router_debug["timing"]["hybrid_total_time"] = hybrid_total_time
+
         print("\n" + "-" * 120)
         print(f"[Hybrid ROI Refine] step={step_idx}")
-        print(f"small full time = {small_time_cond + small_time_cfg:.3f}s")
-        print(f"large branch total time = {total_large_cond + total_large_cfg:.3f}s")
-        print(f"ls_gap_refresh = {need_ls_gap_refresh}")
+        print(f"small full time        = {small_time_cond + small_time_cfg:.3f}s")
+        print(f"router build time      = {router_build_time:.3f}s")
+        print(f"large branch total time= {total_large_cond + total_large_cfg:.3f}s")
+        print(f"hybrid refine total    = {hybrid_total_time:.3f}s")
+        print(f"ls_gap_refresh         = {need_ls_gap_refresh}")
         for item in crop_debug:
             print(
                 f"  crop#{item['roi_idx']}: mode={item['mode']}, "
@@ -1264,7 +1320,7 @@ class HybridWanPipeline(WanPipeline):
                     from diffusers import FlowMatchEulerDiscreteScheduler
                     
                     # Time the scheduler step
-                    t_scheduler_start = time_module.perf_counter()
+                    t_scheduler_start = self._perf_counter_sync(latents, noise_pred)
                     
                     if isinstance(self.scheduler, FlowMatchEulerDiscreteScheduler):
                         # Flow Matching scheduler with specific parameters
@@ -1285,7 +1341,7 @@ class HybridWanPipeline(WanPipeline):
                             return_dict=False
                         )[0]
                     
-                    scheduler_time = time_module.perf_counter() - t_scheduler_start
+                    scheduler_time = self._elapsed_sync(t_scheduler_start, latents)
                 except Exception as e:
                     logger.error(f"Step {i}/{num_inference_steps}: Error in scheduler.step: {e}")
                     logger.error(f"noise_pred shape: {noise_pred.shape}, dtype: {noise_pred.dtype}")
@@ -1318,53 +1374,38 @@ class HybridWanPipeline(WanPipeline):
                     latents.std().item(),
                 )
                 
-                # Calculate step time and cumulative time
-                step_time = model_time_cond + model_time_cfg
-                cumulative_time += step_time
-                
-                # Add scheduler time to get total step time
-                total_step_time = step_time + scheduler_time
-                cumulative_time += scheduler_time
-                
-                # For detailed timing breakdown, we use actual transformer time and estimate based on typical transformer architecture
-                # Based on user's example: Self Attention ~54%, Cross Attention ~1.6%, FFN ~4.1% of total step time
-                # Total transformer ~64.5%, scheduler/other ~35.5%
-                # These ratios are based on transformer time:
-                # - Self ~83.6%, Cross ~2.5%, FFN ~6.3%, Other ~7.6%
-                self_attn_ratio = 0.836  # Self-attention: 83.6% of transformer time
-                cross_attn_ratio = 0.025  # Cross-attention: 2.5% of transformer time  
-                ffn_ratio = 0.063         # FFN: 6.3% of transformer time
-                other_transformer_ratio = 0.076  # Other transformer overhead: 7.6% of transformer time
-                
-                # Calculate estimated times based on transformer time only
-                transformer_only_time = step_time
-                est_self_attn = transformer_only_time * self_attn_ratio
-                est_cross_attn = transformer_only_time * cross_attn_ratio
-                est_ffn = transformer_only_time * ffn_ratio
-                est_other = transformer_only_time * other_transformer_ratio
-                
-                # Accumulate detailed timings
-                total_self_attn_time += est_self_attn
-                total_cross_attn_time += est_cross_attn
-                total_ffn_time += est_ffn
+                # 真实同步后的 step timing
+                model_forward_time = model_time_cond + model_time_cfg
+
+                router_build_time = 0.0
+                hybrid_refine_total = model_forward_time
+                if mode == "hybrid" and _router_dbg is not None:
+                    timing_info = _router_dbg.get("timing", {})
+                    router_build_time = float(timing_info.get("router_build_time", 0.0))
+                    hybrid_refine_total = float(timing_info.get("hybrid_total_time", model_forward_time))
+
+                if mode == "hybrid":
+                    total_step_time = hybrid_refine_total + scheduler_time
+                    other_time = max(total_step_time - model_forward_time - router_build_time - scheduler_time, 0.0)
+                else:
+                    total_step_time = model_forward_time + scheduler_time
+                    other_time = max(total_step_time - model_forward_time - scheduler_time, 0.0)
+
+                cumulative_time += total_step_time
                 total_scheduler_time += scheduler_time
-                
-                # Calculate transformer total and percentages
-                transformer_total = est_self_attn + est_cross_attn + est_ffn + est_other
-                
-                # Print detailed timing for each step in the requested format
-                print("="*80)
+
+                print("=" * 80)
                 print(f"Step {i+1}/{num_inference_steps} - {model_name}")
-                print("="*80)
-                print("时间组成:")
-                print(f"  Self Attention:  {est_self_attn:.3f}s ({est_self_attn/total_step_time*100:.1f}%)")
-                print(f"  Cross Attention: {est_cross_attn:.3f}s ({est_cross_attn/total_step_time*100:.1f}%)")
-                print(f"  FFN:            {est_ffn:.3f}s ({est_ffn/total_step_time*100:.1f}%)")
-                print(f"  Transformer总计: {transformer_total:.3f}s ({transformer_total/total_step_time*100:.1f}%)")
-                print(f"  Scheduler+其他:  {scheduler_time:.3f}s ({scheduler_time/total_step_time*100:.1f}%)")
+                print("=" * 80)
+                print("时间组成（真实同步计时）:")
+                print(f"  Model Forward:   {model_forward_time:.3f}s")
+                if mode == "hybrid":
+                    print(f"  Router Build:    {router_build_time:.3f}s")
+                print(f"  Scheduler:       {scheduler_time:.3f}s")
+                print(f"  Other:           {other_time:.3f}s")
                 print("  ──────────────────────────────────")
-                print(f"  Step总时间:     {total_step_time:.3f}s")
-                print("="*80)
+                print(f"  Step总时间:      {total_step_time:.3f}s")
+                print("=" * 80)
                 
                 # Callback
                 if callback_on_step_end is not None:
@@ -1433,9 +1474,9 @@ class HybridWanPipeline(WanPipeline):
 
                 # Decode using VAE
                 # latents shape: (B, C, T, H, W)
-                t_vae_start = time_module.perf_counter()
+                t_vae_start = self._perf_counter_sync(latents)
                 video = self.vae.decode(latents, return_dict=False)[0]
-                vae_decode_time = time_module.perf_counter() - t_vae_start
+                vae_decode_time = self._elapsed_sync(t_vae_start, latents)
                 
                 print()
                 print("="*80)

@@ -257,23 +257,32 @@ class VideoMaskRouter:
             "ema_alpha": 0.85,
             "aux_ema_alpha": 0.70,
             "relative_diff": True,
+
+            # 只保留 4 个实际使用的 cue
             "step_diff_weight": 1.0,
             "cfg_gap_weight": 0.8,
-            "ls_gap_weight": 0.8,
+            "warp_weight": 0.8,
+            "traj_curv_weight": 0.6,
+
+            # 这些保留字段，但默认不使用
+            "ls_gap_weight": 0.0,
             "motion_weight": 0.0,
-            "warp_weight": 0.5,
-            "traj_curv_weight": 0.5,
-            "traj_flip_weight": 0.3,
+            "traj_flip_weight": 0.0,
+
             "use_warp_cue": True,
             "warp_max_shift": 2,
-            "ls_gap_every": 2,
-            "force_ls_gap_first": True,
+
+            "ls_gap_every": 0,
+            "force_ls_gap_first": False,
+
             "motion_blur_kernel": 3,
+
             "temporal_top_ratio": 0.15,
             "temporal_topq_ratio": 0.10,
             "temporal_pool": "topq",
             "temporal_dilate": 1,
             "max_segments": 2,
+
             "spatial_top_ratio": 0.08,
             "spatial_dilate": 1,
             "spatial_blur_kernel": 9,
@@ -281,25 +290,33 @@ class VideoMaskRouter:
             "spatial_cc_min_area": 12,
             "spatial_min_bbox_ratio": 0.01,
             "spatial_max_bbox_ratio": 0.55,
+
             "max_rois_per_segment": 2,
             "max_total_rois": 4,
             "roi_nms_iou_thresh": 0.12,
+
             "projection_keep_ratio_h": 0.65,
             "projection_keep_ratio_w": 0.65,
             "projection_blur_kernel": 9,
+
             "margin_t": 1,
             "margin_h": 4,
             "margin_w": 4,
+
             "min_crop_t": 1,
             "min_crop_h": 8,
             "min_crop_w": 8,
+
             "align_h": 2,
             "align_w": 2,
+
             "smooth_iou_thresh": 0.25,
             "smooth_momentum": 0.6,
+
             "debug_every": 1,
             "debug_topk_frames": 5,
             "save_debug_dir": None,
+
             "use_tube_spatial": True,
             "tube_link_iou_thresh": 0.15,
             "tube_debug_max_frames": 8,
@@ -325,6 +342,71 @@ class VideoMaskRouter:
         self._prev_latents_delta: Optional[torch.Tensor] = None
         self.prev_rois: List[Dict[str, Any]] = []
         self.last_ls_gap_step: int = -10**9
+
+    def _active_cue_names(self) -> List[str]:
+        """
+        当前版本只实际使用 4 个 cue：
+          step_diff + cfg_gap + warp + traj_curv
+        """
+        return ["step_diff", "cfg_gap", "warp", "traj_curv"]
+
+    def _repair_roi_geometry(
+        self,
+        roi: Dict[str, Any],
+        t_len: int,
+        h: int,
+        w: int,
+    ) -> Dict[str, Any]:
+        """
+        对 smoothing 后的 ROI 做几何修复：
+        - core 先 clamp 到合法范围
+        - outer 不再直接相信 smoothing 后的坐标
+        - 而是重新基于 core + margin + align 生成合法 outer
+        这样能彻底避免 outer 过紧 / 不对齐，导致 paste clipped。
+        """
+        core_t0 = max(0, min(int(roi["core_t0"]), t_len - 1))
+        core_t1 = max(core_t0 + 1, min(int(roi["core_t1"]), t_len))
+
+        core_y0 = max(0, min(int(roi["core_y0"]), h - 1))
+        core_y1 = max(core_y0 + 1, min(int(roi["core_y1"]), h))
+
+        core_x0 = max(0, min(int(roi["core_x0"]), w - 1))
+        core_x1 = max(core_x0 + 1, min(int(roi["core_x1"]), w))
+
+        repaired = self._make_roi(
+            t_len=t_len,
+            h=h,
+            w=w,
+            core_t0=core_t0,
+            core_t1=core_t1,
+            core_y0=core_y0,
+            core_y1=core_y1,
+            core_x0=core_x0,
+            core_x1=core_x1,
+        )
+
+        # 保留非几何元信息
+        geom_keys = {
+            "t0", "t1", "y0", "y1", "x0", "x1",
+            "core_t0", "core_t1", "core_y0", "core_y1", "core_x0", "core_x1",
+            "local_core_t0", "local_core_t1", "local_core_y0", "local_core_y1",
+            "local_core_x0", "local_core_x1",
+        }
+        for k, v in roi.items():
+            if k not in geom_keys:
+                repaired[k] = v
+
+        repaired["geometry_repaired"] = True
+        return repaired
+
+    def _repair_all_rois(
+        self,
+        rois: List[Dict[str, Any]],
+        t_len: int,
+        h: int,
+        w: int,
+    ) -> List[Dict[str, Any]]:
+        return [self._repair_roi_geometry(r, t_len=t_len, h=h, w=w) for r in rois]
 
     def compute_diff_map(self, latents_before: torch.Tensor, latents_after: torch.Tensor) -> torch.Tensor:
         diff = (latents_before - latents_after).abs().mean(dim=1)
@@ -429,6 +511,7 @@ class VideoMaskRouter:
     ):
         alpha = float(self.config.get("aux_ema_alpha", 0.70))
 
+        # warp 是 motion 的升级版：当前只保留 warp，不再实际使用 motion
         use_warp = bool(self.config.get("use_warp_cue", True)) and float(
             self.config.get("warp_weight", 0.0)
         ) > 0.0
@@ -442,14 +525,8 @@ class VideoMaskRouter:
         else:
             self.warp_ema = None
 
-        if float(self.config.get("motion_weight", 0.0)) > 0.0:
-            motion_map = self.compute_motion_map(latents)
-            if self.motion_ema is None:
-                self.motion_ema = motion_map
-            else:
-                self.motion_ema = alpha * self.motion_ema + (1.0 - alpha) * motion_map
-        else:
-            self.motion_ema = None
+        # 当前版本默认不再使用 motion
+        self.motion_ema = None
 
         if cfg_gap_map is not None:
             cfg_gap_map = cfg_gap_map.float()
@@ -458,38 +535,37 @@ class VideoMaskRouter:
             else:
                 self.cfg_gap_ema = alpha * self.cfg_gap_ema + (1.0 - alpha) * cfg_gap_map
 
-        if ls_gap_map is not None:
+        # 当前版本默认不再使用 ls_gap，但接口保留
+        if ls_gap_map is not None and float(self.config.get("ls_gap_weight", 0.0)) > 0.0:
             ls_gap_map = ls_gap_map.float()
             if self.ls_gap_ema is None:
                 self.ls_gap_ema = ls_gap_map
             else:
                 self.ls_gap_ema = alpha * self.ls_gap_ema + (1.0 - alpha) * ls_gap_map
             self.last_ls_gap_step = step_idx
+        else:
+            self.ls_gap_ema = None
 
     def _compose_score_maps(self) -> Dict[str, Optional[torch.Tensor]]:
+        # 当前版本只实际使用 4 个 cue
         cues = {
             "step_diff": _normalize_map_per_sample(self.score_ema),
             "cfg_gap": _normalize_map_per_sample(self.cfg_gap_ema),
-            "ls_gap": _normalize_map_per_sample(self.ls_gap_ema),
-            "motion": _normalize_map_per_sample(self.motion_ema),
             "warp": _normalize_map_per_sample(self.warp_ema),
             "traj_curv": _normalize_map_per_sample(self.traj_curv_ema),
-            "traj_flip": _normalize_map_per_sample(self.traj_flip_ema),
         }
 
         weights = {
             "step_diff": float(self.config.get("step_diff_weight", 1.0)),
             "cfg_gap": float(self.config.get("cfg_gap_weight", 0.8)),
-            "ls_gap": float(self.config.get("ls_gap_weight", 0.8)),
-            "motion": float(self.config.get("motion_weight", 0.0)),
-            "warp": float(self.config.get("warp_weight", 0.5)),
-            "traj_curv": float(self.config.get("traj_curv_weight", 0.5)),
-            "traj_flip": float(self.config.get("traj_flip_weight", 0.3)),
+            "warp": float(self.config.get("warp_weight", 0.8)),
+            "traj_curv": float(self.config.get("traj_curv_weight", 0.6)),
         }
 
         combined: Optional[torch.Tensor] = None
         wsum = 0.0
-        for name, m in cues.items():
+        for name in self._active_cue_names():
+            m = cues.get(name, None)
             if m is None:
                 continue
             w = max(0.0, weights[name])
@@ -501,14 +577,8 @@ class VideoMaskRouter:
         if combined is None:
             if self.score_ema is not None:
                 combined = torch.zeros_like(self.score_ema)
-            elif self.cfg_gap_ema is not None:
-                combined = torch.zeros_like(self.cfg_gap_ema)
-            elif self.warp_ema is not None:
-                combined = torch.zeros_like(self.warp_ema)
-            elif self.motion_ema is not None:
-                combined = torch.zeros_like(self.motion_ema)
             else:
-                raise RuntimeError("No cue available to compose score.")
+                raise RuntimeError("No active cue available to compose score.")
             wsum = 1.0
 
         combined = combined / max(wsum, 1e-6)
@@ -632,9 +702,15 @@ class VideoMaskRouter:
 
         return roi
 
-    def _smooth_rois(self, rois: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _smooth_rois(
+        self,
+        rois: List[Dict[str, Any]],
+        t_len: int,
+        h: int,
+        w: int,
+    ) -> List[Dict[str, Any]]:
         if not self.prev_rois or not rois:
-            return rois
+            return self._repair_all_rois(rois, t_len=t_len, h=h, w=w)
 
         momentum = float(self.config.get("smooth_momentum", 0.6))
         iou_thresh = float(self.config.get("smooth_iou_thresh", 0.25))
@@ -662,23 +738,12 @@ class VideoMaskRouter:
                 for k in ["t0", "t1", "y0", "y1", "x0", "x1"]:
                     out[k] = int(round(momentum * prev_roi[k] + (1.0 - momentum) * roi[k]))
 
-                out["t0"] = min(out["t0"], out["core_t0"])
-                out["y0"] = min(out["y0"], out["core_y0"])
-                out["x0"] = min(out["x0"], out["core_x0"])
-                out["t1"] = max(out["t1"], out["core_t1"])
-                out["y1"] = max(out["y1"], out["core_y1"])
-                out["x1"] = max(out["x1"], out["core_x1"])
-
-                out["local_core_t0"] = out["core_t0"] - out["t0"]
-                out["local_core_t1"] = out["core_t1"] - out["t0"]
-                out["local_core_y0"] = out["core_y0"] - out["y0"]
-                out["local_core_y1"] = out["core_y1"] - out["y0"]
-                out["local_core_x0"] = out["core_x0"] - out["x0"]
-                out["local_core_x1"] = out["core_x1"] - out["x0"]
-
+                # 这里只是先保留平滑后的 outer 草案，
+                # 真正合法 outer 后面统一通过 repair 重新基于 core 生成
+                out = self._repair_roi_geometry(out, t_len=t_len, h=h, w=w)
                 smoothed_rois.append(out)
             else:
-                smoothed_rois.append(roi)
+                smoothed_rois.append(self._repair_roi_geometry(roi, t_len=t_len, h=h, w=w))
 
         return smoothed_rois
 
@@ -999,7 +1064,7 @@ class VideoMaskRouter:
             rois.append(roi)
 
         rois = sorted(rois, key=lambda r: (r["core_t0"], r["core_y0"], r["core_x0"]))
-        rois = self._smooth_rois(rois)
+        rois = self._smooth_rois(rois, t_len=t_len, h=h, w=w)
         self.prev_rois = [r.copy() for r in rois]
 
         topk_frames = min(int(self.config.get("debug_topk_frames", 5)), temporal_score.shape[1])
@@ -1019,7 +1084,7 @@ class VideoMaskRouter:
         )
         full_volume = max(1, t_len * h * w)
 
-        cue_keys = ["step_diff", "cfg_gap", "ls_gap", "motion", "warp", "traj_curv", "traj_flip"]
+        active_cues = self._active_cue_names()
         debug = {
             "step_idx": step_idx,
             "router_warm_start": False,
@@ -1033,15 +1098,12 @@ class VideoMaskRouter:
             "cue_weights": {
                 "step_diff": float(self.config.get("step_diff_weight", 1.0)),
                 "cfg_gap": float(self.config.get("cfg_gap_weight", 0.8)),
-                "ls_gap": float(self.config.get("ls_gap_weight", 0.8)),
-                "motion": float(self.config.get("motion_weight", 0.0)),
-                "warp": float(self.config.get("warp_weight", 0.5)),
-                "traj_curv": float(self.config.get("traj_curv_weight", 0.5)),
-                "traj_flip": float(self.config.get("traj_flip_weight", 0.3)),
+                "warp": float(self.config.get("warp_weight", 0.8)),
+                "traj_curv": float(self.config.get("traj_curv_weight", 0.6)),
             },
             "cue_means": {
                 name: (None if cue_maps.get(name) is None else float(cue_maps[name].mean().item()))
-                for name in cue_keys
+                for name in active_cues
             },
             "ls_gap_last_step": int(self.last_ls_gap_step),
             "temporal_top_frames": top_idx.tolist(),
@@ -1061,10 +1123,7 @@ class VideoMaskRouter:
             save_payload: Dict[str, Any] = {
                 "step_diff_ema": None if self.score_ema is None else self.score_ema.detach().cpu(),
                 "traj_curv_ema": None if self.traj_curv_ema is None else self.traj_curv_ema.detach().cpu(),
-                "traj_flip_ema": None if self.traj_flip_ema is None else self.traj_flip_ema.detach().cpu(),
                 "cfg_gap_ema": None if self.cfg_gap_ema is None else self.cfg_gap_ema.detach().cpu(),
-                "ls_gap_ema": None if self.ls_gap_ema is None else self.ls_gap_ema.detach().cpu(),
-                "motion_ema": None if self.motion_ema is None else self.motion_ema.detach().cpu(),
                 "warp_ema": None if self.warp_ema is None else self.warp_ema.detach().cpu(),
                 "combined_score": combined.detach().cpu(),
                 "temporal_score": temporal_score.detach().cpu(),

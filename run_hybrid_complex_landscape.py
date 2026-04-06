@@ -169,21 +169,32 @@ class Args:
         self.stage_steps = STAGE_STEPS
         self.steps = STAGE_STEPS
 
-        # ROI router（思路二）
+        # ROI router
         self.hybrid_ema_alpha = 0.85
         self.hybrid_aux_ema_alpha = 0.70
         self.hybrid_relative_diff = True
 
+        # 当前只保留 4 个 cue
         self.hybrid_step_diff_weight = 1.0
         self.hybrid_cfg_gap_weight = 0.8
+        self.hybrid_warp_weight = 0.8
+        self.hybrid_traj_curv_weight = 0.6
+
+        # 这些默认不使用
+        self.hybrid_motion_weight = 0.0
+        self.hybrid_traj_flip_weight = 0.0
         self.hybrid_ls_gap_weight = 0.0
-        self.hybrid_motion_weight = 0.5
+
+        self.hybrid_use_warp_cue = True
+        self.hybrid_warp_max_shift = 2
 
         self.hybrid_ls_gap_every = 0
         self.hybrid_force_ls_gap_first = False
         self.hybrid_motion_blur_kernel = 3
 
         self.hybrid_temporal_top_ratio = 0.15
+        self.hybrid_temporal_topq_ratio = 0.10
+        self.hybrid_temporal_pool = "topq"
         self.hybrid_temporal_dilate = 1
         self.hybrid_max_segments = 2
 
