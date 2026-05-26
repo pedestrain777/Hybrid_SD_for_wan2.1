@@ -1,0 +1,8 @@
+0	A dog running across a green grass field, cinematic lighting.
+1	A dancer spinning quickly under colorful stage lights.
+2	A person pouring water from a bottle into a glass on a wooden table.
+3	A camera slowly pans across a busy city street at night.
+4	Two children playing basketball on an outdoor court.
+5	A boat floating on a calm lake with mountains in the background.
+6	A horse galloping through shallow water on a beach.
+7	A cat jumps from a sofa onto a table in a living room.

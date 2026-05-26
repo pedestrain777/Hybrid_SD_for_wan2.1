@@ -1,55 +1,37 @@
-# =========================
-# Python / system artifacts
-# =========================
-__pycache__/
+.*
 *.py[cod]
-*.so
-*.egg-info/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.coverage
-.coverage.*
+# *.jpg
+*.jpeg
+# *.png
+*.gif
+*.bmp
+*.mp4
+*.mov
+*.mkv
 *.log
-
-# =========================
-# Runtime outputs / caches
-# =========================
-logs/
-results/
-outputs/
-tmp/
-temp/
-cache/
-wandb/
-
-# =========================
-# Local environments
-# =========================
-.venv/
-venv/
-env/
-.env
+*.zip
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.json
+# *.txt
+*.backup
+*.pkl
+*.html
+*.pdf
+*.whl
+cache
+__pycache__/
+storage/
+samples/
+!.gitignore
+!requirements.txt
 .DS_Store
-
-# =========================
-# Ignore VBench evaluation stack
-# Keep repo focused on HybridSD Wan collaborative generation
-# =========================
-VBench-master/
-tools/vbench/
-scripts/vbench/
-scripts/run_vbench*.sh
-run_vbench*.sh
-run_*vbench*.py
-*vbench*.py
-*vbench*.md
-VBENCH*.md
-configs/vbench*.yaml
-configs/*vbench*.yml
-configs/*vbench*.yaml
-
-# VBench/eval typical artifacts
-**/metrics/
-**/eval*/
-**/*_eval*/
+*DS_Store
+google/
+Wan2.1-T2V-14B/
+Wan2.1-T2V-1.3B/
+Wan2.1-I2V-14B-480P/
+Wan2.1-I2V-14B-720P/
+poetry.lock
