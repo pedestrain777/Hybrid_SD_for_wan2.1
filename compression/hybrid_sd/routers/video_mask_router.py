@@ -198,6 +198,7 @@ class VideoMaskRouter:
             "save_debug_dir": None,
             "debug_every": 1,
             "debug_topk_frames": 5,
+            "debug_save_all_cues": True,
 
             # Backward-compatible aliases/ignored keys from the old router.
             "max_total_rois": 2,
@@ -294,7 +295,8 @@ class VideoMaskRouter:
             self.cfg_gap_map = None
 
         spatial_cue = str(self.config.get("spatial_cue", "cfg")).lower()
-        if spatial_cue == "warp":
+        save_all_cues = bool(self.config.get("debug_save_all_cues", True))
+        if spatial_cue == "warp" or save_all_cues:
             self.warp_map = _compute_warp_residual(latents.detach().float(), int(self.config.get("warp_max_shift", 2)))
         else:
             self.warp_map = None
@@ -362,6 +364,18 @@ class VideoMaskRouter:
                 warp = _compute_warp_residual(latents, int(self.config.get("warp_max_shift", 2)))
             return "warp", warp
         raise ValueError(f"Unsupported spatial_cue={spatial_cue!r}; expected cfg/motion/warp.")
+
+    def _candidate_spatial_sources(self, latents: torch.Tensor) -> Dict[str, torch.Tensor]:
+        sources: Dict[str, torch.Tensor] = {}
+        if self.cfg_gap_ema is not None:
+            sources["cfg"] = self.cfg_gap_ema.float()
+        motion = self.motion_map if self.motion_map is not None else _compute_frame_diff_map(latents)
+        sources["motion"] = motion.float()
+        warp = self.warp_map
+        if warp is None:
+            warp = _compute_warp_residual(latents, int(self.config.get("warp_max_shift", 2)))
+        sources["warp"] = warp.float()
+        return sources
 
     def _segment_to_cube(
         self,
@@ -472,6 +486,7 @@ class VideoMaskRouter:
         rois: List[Dict[str, Any]] = []
         spatial_debug: List[Dict[str, Any]] = []
         debug_tensors: Dict[str, Any] = {}
+        candidate_spatial_debug: Dict[str, List[Dict[str, Any]]] = {}
         for rank, (seg_score, s, e) in enumerate(selected_segments):
             roi, entry, spatial_norm, top_mask = self._segment_to_cube(
                 spatial_source=spatial_source,
@@ -486,6 +501,27 @@ class VideoMaskRouter:
             spatial_debug.append(entry)
             debug_tensors[f"seg{rank}_spatial_score_norm"] = spatial_norm
             debug_tensors[f"seg{rank}_spatial_top_mask"] = top_mask
+
+        if bool(self.config.get("debug_save_all_cues", True)):
+            for cue_name, cue_source in self._candidate_spatial_sources(latents).items():
+                if cue_source.shape[2:] != (h, w):
+                    continue
+                candidate_spatial_debug[cue_name] = []
+                for rank, (seg_score, s, e) in enumerate(selected_segments):
+                    cand_roi, cand_entry, cand_score, cand_mask = self._segment_to_cube(
+                        spatial_source=cue_source,
+                        segment=(s, e),
+                        seg_rank=rank,
+                        seg_score=seg_score,
+                        t_len=t_len,
+                        h=h,
+                        w=w,
+                    )
+                    cand_entry["cue"] = cue_name
+                    cand_entry["roi"] = cand_roi
+                    candidate_spatial_debug[cue_name].append(cand_entry)
+                    debug_tensors[f"candidate_{cue_name}_seg{rank}_spatial_score_norm"] = cand_score
+                    debug_tensors[f"candidate_{cue_name}_seg{rank}_spatial_top_mask"] = cand_mask
 
         if not rois:
             rois = [self._make_roi(t_len, h, w, 0, t_len, 0, h, 0, w)]
@@ -527,6 +563,7 @@ class VideoMaskRouter:
             "core_ratio": float(total_core / full_volume),
             "outer_ratio": float(total_outer / full_volume),
             "spatial_debug": spatial_debug,
+            "candidate_spatial_debug": candidate_spatial_debug,
         }
 
         save_dir = self.config.get("save_debug_dir", None)

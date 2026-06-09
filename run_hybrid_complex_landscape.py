@@ -107,6 +107,32 @@ def _parse_cli():
         help="每个 Hybrid step 最多让大模型处理几个时空 cube。",
     )
     parser.add_argument(
+        "--num-frames",
+        type=int,
+        default=int(os.environ.get("WAN_HYBRID_NUM_FRAMES", 81)),
+        help="生成视频帧数，默认 81。",
+    )
+    parser.add_argument(
+        "--height",
+        type=int,
+        default=int(os.environ.get("WAN_HYBRID_HEIGHT", 720)),
+        help="生成视频高度，默认 720。",
+    )
+    parser.add_argument(
+        "--width",
+        type=int,
+        default=int(os.environ.get("WAN_HYBRID_WIDTH", 1280)),
+        help="生成视频宽度，默认 1280。",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=os.environ.get(
+            "WAN_HYBRID_OUTPUT_DIR",
+            "/data/chenjiayu/minyu_lee/Hybrid-sd_wan/results/vbench/hybrid_wan2.1_14B_1.3B_complex_landscape/videos",
+        ),
+        help="输出视频目录。",
+    )
+    parser.add_argument(
         "prompt_args",
         nargs="*",
         help="省略=文件第 0 行；仅一个非负整数=该行 prompt；否则整句合并为自定义 prompt",
@@ -157,7 +183,7 @@ sys.path.insert(0, str(_REPO_ROOT))
 
 from compression.hybrid_sd.inference_pipeline import HybridVideoInferencePipeline
 
-OUTPUT_DIR = Path("/data/chenjiayu/minyu_lee/Hybrid-sd_wan/results/vbench/hybrid_wan2.1_14B_1.3B_complex_landscape/videos")
+OUTPUT_DIR = Path(_ns.output_dir)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # 模型配置
@@ -167,9 +193,9 @@ MODEL_PATHS = [
 ]
 
 # 生成参数
-NUM_FRAMES = 81
-HEIGHT = 720
-WIDTH = 1280
+NUM_FRAMES = _ns.num_frames
+HEIGHT = _ns.height
+WIDTH = _ns.width
 GUIDANCE_SCALE = 5.0
 FPS = 16
 SEED = 0
@@ -224,6 +250,7 @@ class Args:
         # Debug 保存
         self.hybrid_debug_every = 1
         self.hybrid_debug_topk_frames = 5
+        self.hybrid_debug_save_all_cues = True
         self.hybrid_debug_save_dir = str(
             OUTPUT_DIR.parent / "debug_roi" / f"{prompt_tag}__{CONFIG_SLUG}"
         )
