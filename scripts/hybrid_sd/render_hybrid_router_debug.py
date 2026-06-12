@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import math
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -124,7 +125,17 @@ def _load_video_frame(video_path: Optional[Path], latent_idx: int, latent_t: int
 
     try:
         meta = iio.immeta(video_path)
-        nframes = int(meta.get("nframes") or meta.get("duration", 0) * meta.get("fps", 0) or 0)
+        raw_nframes = meta.get("nframes")
+        if raw_nframes is None or not math.isfinite(float(raw_nframes)):
+            nframes = 0
+        else:
+            nframes = int(raw_nframes)
+        if nframes <= 0:
+            duration = float(meta.get("duration") or 0)
+            fps = float(meta.get("fps") or 0)
+            if math.isfinite(duration) and math.isfinite(fps):
+                nframes = int(duration * fps)
+
         if nframes <= 0:
             frames = iio.imread(video_path)
             nframes = len(frames)
