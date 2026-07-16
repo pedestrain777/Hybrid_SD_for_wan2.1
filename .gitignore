@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+*.log
+*.pid
+logs/
+results/
+*.egg-info/
+dist/
+build/
+.eggs/
+*.so
+*.pt
+*.pth
+*.ckpt
+*.safetensors

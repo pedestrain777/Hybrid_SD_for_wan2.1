@@ -1,0 +1,63 @@
+# 1. 实验基本信息（定义任务目标与存储路径）
+exp_name: Hybrid-SD_CogvideoX-5B+2B_VBench
+output_root: results/vbench/hybrid_sd  # 输出结果（视频、指标、日志）存储根目录
+reference_root: results/vbench/reference/hybrid_sd_baseline_25_0  # 基线模型参考结果路径
+
+# 2. 数据与Prompt配置
+prompt_file: VBench-master/VBench-2.0/prompts/VBench2_full_text.txt  # VBench 2.0 全量英文 prompt 列表
+negative_prompt_file: null  # 无负Prompt设置
+seed_list: [1234]  # 每个 prompt 生成一条视频
+
+# 3. 模型与硬件配置
+models:
+  - pretrained_models/CogVideoX-5b  # 云侧大模型
+  - pretrained_models/CogVideoX-2b  # 边缘侧轻量模型
+device: cuda:0  # 单进程推理用可见列表的第0卡（启动时用 CUDA_VISIBLE_DEVICES 控制物理GPU）
+distributed: false  # 单进程，不做分布式
+data_parallel: false  # 不做按Prompt分片
+
+# 4. 生成核心参数
+steps: "38,12"  # Hybrid-SD: 云侧38步+边缘12步（总50步）
+sampler: DPM++  # 采样器
+num_frames: 49  # 视频帧数（匹配VBench 2.0）
+resolution:
+  height: 480
+  width: 720  # 分辨率
+guidance_scale: 6.0  # CogVideoX最优值
+fps: 8  # 帧率（匹配VBench 2.0）
+frame_format: png  # 中间帧格式
+batch_size: 1  # 单卡batch=1
+vae_device: cuda:0  # 推理与VAE都在同一张可见卡上
+use_dynamic_cfg: true  # 开启动态cfg
+dtype: float16
+
+# 5. 评估与性能监控参数（适配VBench 2.0）
+calc_psnr_ssim_lpips: true  # 计算图像质量指标
+run_vbench_metrics: true  # 计算VBench 2.0 18维度指标
+vbench_metrics:  # VBench 2.0 官方18维度
+  # Visual Quality (4)
+  - temporal_flickering
+  - dynamic_degree
+  - aesthetic_quality
+  - imaging_quality
+  # Faithfulness (5)
+  - subject_consistency
+  - background_consistency
+  - color_consistency
+  - spatial_relationship
+  - motion_smoothness
+  # Human Understanding (3)
+  - human_anatomy
+  - human_identity
+  - human_clothes
+  # Scene Understanding (3)
+  - scene
+  - object_class
+  - multiple_objects
+  # Creative Ability (3)
+  - appearance_style
+  - temporal_style
+  - multi_view_consistency
+measure_latency: true  # 测量推理延迟
+store_frames: false  # 不存储中间帧（节省空间）
+baseline_latency: 245  # CogVideoX-5B纯云推理延迟（用于计算加速比）
