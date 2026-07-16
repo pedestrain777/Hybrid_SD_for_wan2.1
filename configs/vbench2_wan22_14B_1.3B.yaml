@@ -1,0 +1,53 @@
+# EC-Diff VBench 2.0 评测配置 - Wan2.2 14B + Wan2.1 1.3B 混合版本
+# 云侧: Wan2.2-T2V-A14B (高质量)
+# 边缘侧: Wan2.1-T2V-1.3B (轻量快速)
+
+# 1. 实验标识
+experiment_name: Hybrid_sd_Wan2.2-14B+Wan2.1-1.3B_VBench2
+
+# 2. 数据与Prompt配置
+prompt_file: VBench-master/VBench-2.0/prompts/VBench2_full_text.txt
+negative_prompt_file: null
+seed_list: [1234]
+
+# 3. 模型与硬件配置
+models:
+  - /data/chenjiayu/models/Wan2.2-T2V-A14B-Diffusers   # 云侧大模型 (Wan 2.2 14B)
+  - /data/chenjiayu/models/Wan2.1-T2V-1.3B-Diffusers   # 边缘侧轻量模型 (Wan 2.1 1.3B)
+device: cuda:0
+distributed: false
+data_parallel: false
+
+# 4. 生成核心参数
+# 总步数: 40 步
+# 云侧 (Wan2.2 14B): 32 步 (80%)
+# 边缘侧 (Wan2.1 1.3B): 8 步 (20%)
+steps: "32,8"
+
+sampler: UniPC  # Wan 2.2 使用 UniPCMultistepScheduler
+num_frames: 81
+resolution:
+  height: 720
+  width: 1280
+fps: 16
+frame_format: png
+batch_size: 1
+vae_device: cuda:0
+dtype: float16
+
+# 5. Guidance Scale 配置
+# 动态范围: 从 4.0 逐渐降到 3.0
+# 格式: [min, max] 或单个值
+guidance_scale: [3.0, 4.0]
+use_dynamic_cfg: true
+
+# 6. 输出配置
+output_dir: results/vbench/ec_diff_wan2.2_14B_1.3B
+save_videos: true
+save_frames: false
+video_format: mp4
+
+# 7. 日志与调试
+log_level: INFO
+log_file: vbench_wan2.2_generation.log
+show_progress: true

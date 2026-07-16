@@ -1,0 +1,45 @@
+# EC-Diff VBench 2.0 评测配置 - Wan2.1 模型版本
+# 用于在 VBench 2.0 数据集上评估 EC-Diff 协同推理框架
+# 使用 Wan2.1-T2V-14B (云侧) + Wan2.1-T2V-1.3B (边缘侧)
+
+# 1. 实验标识
+experiment_name: Hybrid_sd_Wan2.1-14B+1.3B_VBench  # 实验名称
+
+# 2. 数据与Prompt配置
+prompt_file: VBench-master/VBench-2.0/prompts/VBench2_full_text.txt  # VBench 2.0 全量英文 prompt 列表
+negative_prompt_file: null  # 无负Prompt设置
+seed_list: [1234]  # 每个 prompt 生成一条视频（单seed）
+
+# 3. 模型与硬件配置
+models:
+  - /data/chenjiayu/models/Wan2.1-T2V-14B-Diffusers  # 云侧大模型 (14B)
+  - /data/chenjiayu/models/Wan2.1-T2V-1.3B-Diffusers  # 边缘侧轻量模型 (1.3B)
+device: cuda:0  # 单进程推理用可见列表的第0卡（启动时用 CUDA_VISIBLE_DEVICES 控制物理GPU）
+distributed: false  # 单进程，不做分布式
+data_parallel: false  # 不做按Prompt分片
+
+# 4. 生成核心参数
+steps: "38,12"  # 云侧38步+边缘12步（EC-Diff切换点s=38，总50步）
+sampler: DPM++  # 采样器
+num_frames: 81  # 视频帧数
+resolution:
+  height: 720
+  width: 1280  # 分辨率1280x720
+guidance_scale: 5.0  # 提高guidance scale
+fps: 16  # 帧率16fps
+frame_format: png  # 中间帧格式
+batch_size: 1  # 单卡batch=1
+vae_device: cuda:0  # 推理与VAE都在同一张可见卡上
+use_dynamic_cfg: true  # 开启动态cfg
+dtype: float16
+
+# 5. 输出配置
+output_dir: results/vbench/ec_diff_wan2.1  # 输出根目录
+save_videos: true  # 保存视频文件
+save_frames: false  # 不保存中间帧（节省空间）
+video_format: mp4  # 视频格式
+
+# 6. 日志与调试
+log_level: INFO  # 日志级别
+log_file: vbench_wan2.1_generation.log  # 日志文件名
+show_progress: true  # 显示进度条
