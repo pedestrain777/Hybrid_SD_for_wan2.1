@@ -107,6 +107,31 @@ def _parse_cli():
         help="每个 Hybrid step 最多让大模型处理几个时空 cube。",
     )
     parser.add_argument(
+        "--guidance-scale",
+        type=float,
+        default=float(os.environ.get("WAN_HYBRID_GUIDANCE_SCALE", 5.0)),
+        help="CFG guidance scale。",
+    )
+    parser.add_argument(
+        "--dynamic-cfg",
+        dest="dynamic_cfg",
+        action="store_true",
+        default=os.environ.get("WAN_HYBRID_DYNAMIC_CFG", "0").lower() in {"1", "true", "yes"},
+        help="启用 dynamic CFG（默认关闭，可用 WAN_HYBRID_DYNAMIC_CFG=1 开启）。",
+    )
+    parser.add_argument(
+        "--no-dynamic-cfg",
+        dest="dynamic_cfg",
+        action="store_false",
+        help="关闭 dynamic CFG，使用固定 guidance scale。",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=int(os.environ.get("WAN_HYBRID_SEED", 0)),
+        help="随机种子。",
+    )
+    parser.add_argument(
         "--num-frames",
         type=int,
         default=int(os.environ.get("WAN_HYBRID_NUM_FRAMES", 81)),
@@ -196,9 +221,10 @@ MODEL_PATHS = [
 NUM_FRAMES = _ns.num_frames
 HEIGHT = _ns.height
 WIDTH = _ns.width
-GUIDANCE_SCALE = 5.0
+GUIDANCE_SCALE = _ns.guidance_scale
 FPS = 16
-SEED = 0
+SEED = _ns.seed
+DYNAMIC_CFG = bool(_ns.dynamic_cfg)
 
 
 def _guidance_slug(gs: float) -> str:
@@ -211,7 +237,7 @@ def _guidance_slug(gs: float) -> str:
 CONFIG_SLUG = (
     f"{_stage_slug}_scue{SPATIAL_CUE}_tc{TEMPORAL_TOP_RATIO:g}_"
     f"sc{SPATIAL_TOP_RATIO:g}_mc{MAX_CUBES}_seed{SEED}_f{NUM_FRAMES}_{HEIGHT}x{WIDTH}_"
-    f"g{_guidance_slug(GUIDANCE_SCALE)}_fps{FPS}"
+    f"g{_guidance_slug(GUIDANCE_SCALE)}_dcfg{int(DYNAMIC_CFG)}_fps{FPS}"
 )
 
 
@@ -270,6 +296,7 @@ def main():
     print(f"Hybrid spatial cue: {SPATIAL_CUE}; temporal_top_ratio={TEMPORAL_TOP_RATIO}; spatial_top_ratio={SPATIAL_TOP_RATIO}; max_cubes={MAX_CUBES}")
     print(f"配置标签 CONFIG_SLUG: {CONFIG_SLUG}")
     print(f"Seed: {SEED}")
+    print(f"Guidance scale: {GUIDANCE_SCALE}; dynamic_cfg={DYNAMIC_CFG}")
     print(f"输出: {output_path}")
     args = Args()
     print(f"ROI debug 目录: {args.hybrid_debug_save_dir}")
@@ -297,7 +324,7 @@ def main():
         width=WIDTH,
         guidance_scale=GUIDANCE_SCALE,
         num_videos_per_prompt=1,
-        use_dynamic_cfg=True,
+        use_dynamic_cfg=DYNAMIC_CFG,
         output_type="pil",
     )
 

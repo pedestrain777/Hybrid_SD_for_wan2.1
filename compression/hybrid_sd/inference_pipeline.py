@@ -687,9 +687,10 @@ class HybridVideoInferencePipeline:
         # 1. Load shared Text Encoder (UMT5)
         print(f"Loading Text Encoder (UMT5) from {self.weight_folders[0]}")
         try:
+            wan_dtype = torch.bfloat16
             text_encoder = UMT5EncoderModel.from_pretrained(
                 self.weight_folders[0], subfolder="text_encoder"
-            ).to(self.device, dtype=torch.float16).requires_grad_(False)
+            ).to(self.device, dtype=wan_dtype).requires_grad_(False)
             print(f"✅ UMT5 Text Encoder loaded successfully")
         except Exception as e:
             print(f"❌ Text Encoder loading failed: {e}")
@@ -709,7 +710,7 @@ class HybridVideoInferencePipeline:
         try:
             vae = AutoencoderKLWan.from_pretrained(
                 self.weight_folders[0], subfolder="vae"
-            ).to(self.vae_device, dtype=torch.float16).requires_grad_(False)
+            ).to(self.vae_device, dtype=wan_dtype).requires_grad_(False)
             # Enable VAE memory optimizations to reduce memory usage
             vae.enable_slicing()
             vae.enable_tiling()
@@ -728,10 +729,8 @@ class HybridVideoInferencePipeline:
             try:
                 # Load on single GPU (changed from device_map="auto")
                 transformer = WanTransformer3DModel.from_pretrained(
-                    path, subfolder="transformer", torch_dtype=torch.float16
+                    path, subfolder="transformer", torch_dtype=wan_dtype
                 ).to(self.device).requires_grad_(False)
-                # Ensure all modules are in float16
-                transformer = transformer.half()
                 print(f"  ✅ WanTransformer3DModel loaded successfully (single GPU: {self.device})")
             except Exception as e:
                 print(f"  ❌ Transformer loading failed: {e}")
@@ -768,7 +767,7 @@ class HybridVideoInferencePipeline:
             vae=vae,
             tokenizer=tokenizer,
             transformer=transformers[0],
-            torch_dtype=torch.float16
+            torch_dtype=wan_dtype
         )
         print(f"✅ WanPipeline base pipeline created successfully")
         
@@ -801,7 +800,7 @@ class HybridVideoInferencePipeline:
                 additional_transformer = WanTransformer3DModel.from_pretrained(
                     self.weight_folders[i],
                     subfolder="transformer",
-                    torch_dtype=torch.float16
+                    torch_dtype=wan_dtype
                 ).to(self.device).requires_grad_(False)
                 print(f"  ✅ Additional Transformer #{i} loaded successfully (single GPU: {self.device})")
             except Exception as e:

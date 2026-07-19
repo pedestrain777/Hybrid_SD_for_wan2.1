@@ -19,6 +19,7 @@ Supports switching between multiple transformers (e.g., Wan2.1-14B and Wan2.1-1.
 """
 
 import inspect
+from contextlib import nullcontext
 import warnings
 from typing import Any, Callable, Dict, List, Optional, Union
 import os
@@ -235,13 +236,19 @@ class HybridWanPipeline(WanPipeline):
         return_aux: bool = False,
     ):
         t0 = self._perf_counter_sync(latent_model_input)
-        noise_cond = transformer(
-            hidden_states=latent_model_input,
-            encoder_hidden_states=prompt_embeds,
-            timestep=timestep,
-            attention_kwargs=attention_kwargs,
-            return_dict=False,
-        )[0]
+        cond_cache_context = (
+            transformer.cache_context("cond")
+            if hasattr(transformer, "cache_context")
+            else nullcontext()
+        )
+        with cond_cache_context:
+            noise_cond = transformer(
+                hidden_states=latent_model_input,
+                encoder_hidden_states=prompt_embeds,
+                timestep=timestep,
+                attention_kwargs=attention_kwargs,
+                return_dict=False,
+            )[0]
         cond_time = self._elapsed_sync(t0, noise_cond)
 
         aux = {
@@ -267,13 +274,19 @@ class HybridWanPipeline(WanPipeline):
             return noise_cond, cond_time, uncond_time
 
         t1 = self._perf_counter_sync(latent_model_input)
-        noise_uncond = transformer(
-            hidden_states=latent_model_input,
-            encoder_hidden_states=negative_prompt_embeds,
-            timestep=timestep,
-            attention_kwargs=attention_kwargs,
-            return_dict=False,
-        )[0]
+        uncond_cache_context = (
+            transformer.cache_context("uncond")
+            if hasattr(transformer, "cache_context")
+            else nullcontext()
+        )
+        with uncond_cache_context:
+            noise_uncond = transformer(
+                hidden_states=latent_model_input,
+                encoder_hidden_states=negative_prompt_embeds,
+                timestep=timestep,
+                attention_kwargs=attention_kwargs,
+                return_dict=False,
+            )[0]
         uncond_time = self._elapsed_sync(t1, noise_uncond)
 
         cur_guidance = guidance_scale
@@ -1329,8 +1342,9 @@ class HybridWanPipeline(WanPipeline):
                     step_idx=i,
                 )
                 
-                # Convert latents back to prompt_embeds dtype (same as parent class)
-                latents = latents.to(prompt_embeds.dtype)
+                # Keep latents in float32 like the official WanPipeline. Only latent_model_input is
+                # cast to the transformer dtype at the start of each denoising step; repeatedly
+                # storing the scheduler state in bf16 can accumulate visible degradation.
                 logger.info(
                     "Step %d/%d: latents after step - min: %.4f, max: %.4f, mean: %.4f, std: %.4f",
                     i,
@@ -1490,4 +1504,3 @@ class HybridWanPipeline(WanPipeline):
         self.last_model_timing = dict(self._model_timing_run)
         
         return WanPipelineOutput(frames=video)
-
