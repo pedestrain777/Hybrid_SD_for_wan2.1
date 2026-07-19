@@ -141,6 +141,10 @@ class HybridWanPipeline(WanPipeline):
             "align_h": 2,
             "align_w": 2,
             "position_aware_rope": True,
+            "fusion_mode": "feather",  # hard / feather
+            "feather_t": 1,
+            "feather_h": 2,
+            "feather_w": 2,
 
             "debug_every": 1,
             "debug_topk_frames": 5,
@@ -512,7 +516,10 @@ class HybridWanPipeline(WanPipeline):
                     step_idx, roi_idx, ct0, ct1, cy0, cy1, cx0, cx1,
                 )
                 return
-            noise_fused[:, :, ct0:ct1, cy0:cy1, cx0:cx1] = noise_large[:, :, ct0:ct1, cy0:cy1, cx0:cx1]
+            self._fuse_large_core(
+                noise_fused[:, :, ct0:ct1, cy0:cy1, cx0:cx1],
+                noise_large[:, :, ct0:ct1, cy0:cy1, cx0:cx1],
+            )
             return
 
         lt0 = max(0, int(roi["local_core_t0"]))
@@ -550,7 +557,39 @@ class HybridWanPipeline(WanPipeline):
                 f"This indicates ROI geometry repair failed; outer no longer fully covers core."
             )
 
-        noise_fused[:, :, ct0 : ct0 + st, cy0 : cy0 + sy, cx0 : cx0 + sx] = src
+        self._fuse_large_core(
+            noise_fused[:, :, ct0 : ct0 + st, cy0 : cy0 + sy, cx0 : cx0 + sx],
+            src,
+        )
+
+    @staticmethod
+    def _feather_axis(length: int, width: int, device, dtype) -> torch.Tensor:
+        if width <= 0 or length <= 2 * width:
+            return torch.ones(length, device=device, dtype=dtype)
+        pos = torch.arange(length, device=device, dtype=torch.float32)
+        distance = torch.minimum(pos + 1.0, float(length) - pos)
+        return (distance / float(width + 1)).clamp(max=1.0).to(dtype=dtype)
+
+    def _fuse_large_core(self, dst: torch.Tensor, src: torch.Tensor) -> None:
+        mode = str(self.hybrid_roi_config.get("fusion_mode", "feather")).lower()
+        if mode == "hard":
+            dst.copy_(src)
+            return
+        if mode != "feather":
+            raise ValueError(f"Unsupported ROI fusion_mode={mode!r}; expected 'hard' or 'feather'")
+
+        _, _, size_t, size_h, size_w = src.shape
+        alpha_t = self._feather_axis(
+            size_t, int(self.hybrid_roi_config.get("feather_t", 1)), src.device, src.dtype
+        ).view(1, 1, size_t, 1, 1)
+        alpha_h = self._feather_axis(
+            size_h, int(self.hybrid_roi_config.get("feather_h", 2)), src.device, src.dtype
+        ).view(1, 1, 1, size_h, 1)
+        alpha_w = self._feather_axis(
+            size_w, int(self.hybrid_roi_config.get("feather_w", 2)), src.device, src.dtype
+        ).view(1, 1, 1, 1, size_w)
+        alpha = alpha_t * alpha_h * alpha_w
+        dst.lerp_(src, alpha)
 
     def _run_hybrid_roi_refine(
         self,
@@ -644,19 +683,14 @@ class HybridWanPipeline(WanPipeline):
 
         if noise_large_full is not None:
             for roi_idx, roi in enumerate(rois):
-                noise_fused[
-                    :,
-                    :,
-                    roi["core_t0"]:roi["core_t1"],
-                    roi["core_y0"]:roi["core_y1"],
-                    roi["core_x0"]:roi["core_x1"],
-                ] = noise_large_full[
-                    :,
-                    :,
-                    roi["core_t0"]:roi["core_t1"],
-                    roi["core_y0"]:roi["core_y1"],
-                    roi["core_x0"]:roi["core_x1"],
-                ]
+                self._paste_large_into_fused_core(
+                    noise_fused,
+                    noise_large_full,
+                    roi,
+                    use_local_indices=False,
+                    step_idx=step_idx,
+                    roi_idx=roi_idx,
+                )
 
                 crop_debug.append({
                     "roi_idx": roi_idx,

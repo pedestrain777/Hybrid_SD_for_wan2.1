@@ -114,6 +114,12 @@ def _parse_cli():
         help="仅用于消融：关闭局部 crop 的全局三维 RoPE offset。",
     )
     parser.add_argument(
+        "--fusion-mode",
+        choices=["hard", "feather"],
+        default=os.environ.get("WAN_HYBRID_FUSION_MODE", "feather"),
+        help="大模型 ROI 回填方式；feather 仅增加逐元素融合，无额外模型推理。",
+    )
+    parser.add_argument(
         "--guidance-scale",
         type=float,
         default=float(os.environ.get("WAN_HYBRID_GUIDANCE_SCALE", 5.0)),
@@ -187,6 +193,7 @@ TEMPORAL_TOP_RATIO = _ns.temporal_top_ratio
 SPATIAL_TOP_RATIO = _ns.spatial_top_ratio
 MAX_CUBES = _ns.max_cubes
 POSITION_AWARE_ROPE = bool(_ns.position_aware_rope)
+FUSION_MODE = _ns.fusion_mode
 
 prompt_idx = 0
 prompt_tag = "idx_000"
@@ -248,7 +255,8 @@ def _guidance_slug(gs: float) -> str:
 CONFIG_SLUG = (
     f"{_stage_slug}_scue{SPATIAL_CUE}_tc{TEMPORAL_TOP_RATIO:g}_"
     f"sc{SPATIAL_TOP_RATIO:g}_mc{MAX_CUBES}_seed{SEED}_f{NUM_FRAMES}_{HEIGHT}x{WIDTH}_"
-    f"g{_guidance_slug(GUIDANCE_SCALE)}_dcfg{int(DYNAMIC_CFG)}_rope{int(POSITION_AWARE_ROPE)}_fps{FPS}"
+    f"g{_guidance_slug(GUIDANCE_SCALE)}_dcfg{int(DYNAMIC_CFG)}_rope{int(POSITION_AWARE_ROPE)}_"
+    f"fuse{FUSION_MODE}_fps{FPS}"
 )
 
 
@@ -284,6 +292,10 @@ class Args:
         self.hybrid_align_h = 2
         self.hybrid_align_w = 2
         self.hybrid_position_aware_rope = POSITION_AWARE_ROPE
+        self.hybrid_fusion_mode = FUSION_MODE
+        self.hybrid_feather_t = 1
+        self.hybrid_feather_h = 2
+        self.hybrid_feather_w = 2
 
         # Debug 保存
         self.hybrid_debug_every = 1
@@ -310,6 +322,7 @@ def main():
     print(f"Seed: {SEED}")
     print(f"Guidance scale: {GUIDANCE_SCALE}; dynamic_cfg={DYNAMIC_CFG}")
     print(f"Position-aware RoPE: {POSITION_AWARE_ROPE}")
+    print(f"ROI fusion mode: {FUSION_MODE}")
     print(f"输出: {output_path}")
     args = Args()
     print(f"ROI debug 目录: {args.hybrid_debug_save_dir}")

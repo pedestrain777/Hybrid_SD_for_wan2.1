@@ -52,7 +52,20 @@ def main():
     else:
         raise AssertionError("unaligned ROI origin must be rejected")
 
-    print("RoPE offset regression passed: crop embeddings exactly match the full-video slice")
+    pipe = HybridWanPipeline.__new__(HybridWanPipeline)
+    pipe.hybrid_roi_config = {
+        "fusion_mode": "feather",
+        "feather_t": 1,
+        "feather_h": 2,
+        "feather_w": 2,
+    }
+    dst = torch.zeros(1, 2, 5, 7, 7)
+    src = torch.ones_like(dst)
+    pipe._fuse_large_core(dst, src)
+    assert 0.0 < dst[0, 0, 0, 0, 0].item() < 1.0
+    assert dst[0, 0, 2, 3, 3].item() == 1.0
+
+    print("RoPE/fusion regression passed: exact global positions and feathered ROI boundaries")
 
 
 if __name__ == "__main__":

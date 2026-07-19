@@ -858,6 +858,10 @@ class HybridVideoInferencePipeline:
             "align_h": getattr(self.args, "hybrid_align_h", 2),
             "align_w": getattr(self.args, "hybrid_align_w", 2),
             "position_aware_rope": getattr(self.args, "hybrid_position_aware_rope", True),
+            "fusion_mode": getattr(self.args, "hybrid_fusion_mode", "feather"),
+            "feather_t": getattr(self.args, "hybrid_feather_t", 1),
+            "feather_h": getattr(self.args, "hybrid_feather_h", 2),
+            "feather_w": getattr(self.args, "hybrid_feather_w", 2),
 
             # Debug.
             "debug_every": getattr(self.args, "hybrid_debug_every", 1),
