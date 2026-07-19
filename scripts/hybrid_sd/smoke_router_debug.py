@@ -11,6 +11,7 @@ import torch
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
+from compression.hybrid_sd.routers import video_mask_router as router_module
 from compression.hybrid_sd.routers.video_mask_router import VideoMaskRouter, _topk_binary_mask
 
 
@@ -46,6 +47,27 @@ def _assert_budget_regressions():
     print("budget regressions: exact top-k and flat-cue fallback passed")
 
 
+def _assert_default_debug_is_cheap():
+    latents = torch.zeros(1, 4, 5, 8, 8)
+    latents[:, :, 2:4, 2:6, 2:6] = 1.0
+    cfg_gap = torch.zeros(1, 5, 8, 8)
+    cfg_gap[:, 2:4, 2:6, 2:6] = 2.0
+    router = VideoMaskRouter({"spatial_cue": "cfg"})
+    router.observe_aux(latents, cfg_gap_map=cfg_gap, step_idx=0)
+
+    original_warp = router_module._compute_warp_residual
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("default cfg routing must not compute unused warp cues")
+
+    router_module._compute_warp_residual = fail_if_called
+    try:
+        router.build_rois(latents, step_idx=0)
+    finally:
+        router_module._compute_warp_residual = original_warp
+    print("default debug regression: unused cue computation is disabled")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--out-dir", default="router_debug_smoke")
@@ -54,6 +76,7 @@ def main():
     args = parser.parse_args()
 
     _assert_budget_regressions()
+    _assert_default_debug_is_cheap()
 
     out_dir = Path(args.out_dir)
     if out_dir.exists() and not args.keep:

@@ -11,6 +11,7 @@ __pycache__/
 .coverage
 .coverage.*
 *.log
+*.pid
 
 # =========================
 # Runtime outputs / caches
@@ -22,6 +23,10 @@ tmp/
 temp/
 cache/
 wandb/
+router_debug_*/
+v2_debug_*/
+v2_smoke_outputs*/
+v2_smoke_quality_compare.png
 
 # =========================
 # Local environments
@@ -48,6 +53,12 @@ VBENCH*.md
 configs/vbench*.yaml
 configs/*vbench*.yml
 configs/*vbench*.yaml
+
+# Keep the small, reproducible evaluation helper tracked.
+!vbench1_minimal_v2_pack/
+!vbench1_minimal_v2_pack/**
+vbench1_minimal_v2_pack/**/__pycache__/
+vbench1_minimal_v2_pack/**/*.py[cod]
 
 # VBench/eval typical artifacts
 **/metrics/

@@ -20,13 +20,16 @@ import sys
 import time
 from pathlib import Path
 
-PROMPT_FILE = "/data/chenjiayu/minyu_lee/EC-Diff-main_for_v2i/prompts_complex_landscape.txt"
+REPO_ROOT = Path(__file__).resolve().parent
+DEFAULT_PROMPT_FILE = REPO_ROOT / "scripts" / "prompts" / "vbench_10files_top3.txt"
 
 DEFAULT_STAGE_STEPS = [30, 20]
 
 
-def _load_prompts():
-    with open(PROMPT_FILE, "r", encoding="utf-8", errors="replace") as f:
+def _load_prompts(prompt_file: Path):
+    if not prompt_file.is_file():
+        raise SystemExit(f"prompt 文件不存在: {prompt_file}")
+    with prompt_file.open("r", encoding="utf-8", errors="replace") as f:
         return [line.strip() for line in f if line.strip()]
 
 
@@ -120,6 +123,16 @@ def _parse_cli():
         help="大模型 ROI 回填方式；feather 仅增加逐元素融合，无额外模型推理。",
     )
     parser.add_argument(
+        "--debug-router",
+        action="store_true",
+        help="显式启用 router 日志与 ROI 调试文件；正式测速默认关闭。",
+    )
+    parser.add_argument(
+        "--debug-all-cues",
+        action="store_true",
+        help="调试时额外计算并保存 cfg/motion/warp 全部候选；正式运行不要开启。",
+    )
+    parser.add_argument(
         "--fixed-switch",
         dest="dynamic_switch",
         action="store_false",
@@ -177,11 +190,25 @@ def _parse_cli():
         default=int(os.environ.get("WAN_HYBRID_WIDTH", 1280)),
         help="生成视频宽度，默认 1280。",
     )
+    parser.add_argument("--fps", type=int, default=16, help="输出视频帧率，默认 16。")
+    parser.add_argument(
+        "--prompt-file",
+        default=str(DEFAULT_PROMPT_FILE),
+        help="按行读取 prompt 的文本文件。",
+    )
+    parser.add_argument(
+        "--model-large",
+        default=os.environ.get("WAN_HYBRID_MODEL_LARGE", "/data/chenjiayu/models/Wan2.1-T2V-14B-Diffusers"),
+    )
+    parser.add_argument(
+        "--model-small",
+        default=os.environ.get("WAN_HYBRID_MODEL_SMALL", "/data/chenjiayu/models/Wan2.1-T2V-1.3B-Diffusers"),
+    )
     parser.add_argument(
         "--output-dir",
         default=os.environ.get(
             "WAN_HYBRID_OUTPUT_DIR",
-            "/data/chenjiayu/minyu_lee/Hybrid-sd_wan/results/vbench/hybrid_wan2.1_14B_1.3B_complex_landscape/videos",
+            str(REPO_ROOT / "results" / "generated"),
         ),
         help="输出视频目录。",
     )
@@ -217,13 +244,18 @@ SPATIAL_TOP_RATIO = _ns.spatial_top_ratio
 MAX_CUBES = _ns.max_cubes
 POSITION_AWARE_ROPE = bool(_ns.position_aware_rope)
 FUSION_MODE = _ns.fusion_mode
+DEBUG_ROUTER = bool(_ns.debug_router)
+DEBUG_ALL_CUES = bool(_ns.debug_all_cues)
+if DEBUG_ALL_CUES and not DEBUG_ROUTER:
+    raise SystemExit("--debug-all-cues 需要同时指定 --debug-router")
+PROMPT_FILE = Path(_ns.prompt_file).expanduser().resolve()
 
 prompt_idx = 0
 prompt_tag = "idx_000"
 pa = _ns.prompt_args
 
 if len(pa) == 0:
-    all_prompts = _load_prompts()
+    all_prompts = _load_prompts(PROMPT_FILE)
     prompt = all_prompts[0]
     prompt_idx = 0
     prompt_tag = "idx_000"
@@ -231,7 +263,7 @@ elif len(pa) == 1 and pa[0].isdigit():
     prompt_idx = int(pa[0])
     if prompt_idx < 0:
         raise SystemExit("prompt 行号必须 >= 0")
-    all_prompts = _load_prompts()
+    all_prompts = _load_prompts(PROMPT_FILE)
     if prompt_idx >= len(all_prompts):
         raise SystemExit(f"prompt_idx={prompt_idx} 超出文件行数 {len(all_prompts)}")
     prompt = all_prompts[prompt_idx]
@@ -244,8 +276,7 @@ else:
 os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
 
 # 本仓库根目录，确保加载本地的 compression/hybrid_sd（不要使用其它路径下的旧副本）
-_REPO_ROOT = Path(__file__).resolve().parent
-sys.path.insert(0, str(_REPO_ROOT))
+sys.path.insert(0, str(REPO_ROOT))
 
 from compression.hybrid_sd.inference_pipeline import HybridVideoInferencePipeline
 
@@ -254,8 +285,8 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # 模型配置
 MODEL_PATHS = [
-    "/data/chenjiayu/models/Wan2.1-T2V-14B-Diffusers",
-    "/data/chenjiayu/models/Wan2.1-T2V-1.3B-Diffusers",
+    _ns.model_large,
+    _ns.model_small,
 ]
 
 # 生成参数
@@ -263,7 +294,7 @@ NUM_FRAMES = _ns.num_frames
 HEIGHT = _ns.height
 WIDTH = _ns.width
 GUIDANCE_SCALE = _ns.guidance_scale
-FPS = 16
+FPS = _ns.fps
 SEED = _ns.seed
 DYNAMIC_CFG = bool(_ns.dynamic_cfg)
 
@@ -328,9 +359,12 @@ class Args:
         # Debug 保存
         self.hybrid_debug_every = 1
         self.hybrid_debug_topk_frames = 5
-        self.hybrid_debug_save_all_cues = True
-        self.hybrid_debug_save_dir = str(
-            OUTPUT_DIR.parent / "debug_roi" / f"{prompt_tag}__{CONFIG_SLUG}"
+        self.hybrid_debug_log = DEBUG_ROUTER
+        self.hybrid_debug_save_all_cues = DEBUG_ALL_CUES
+        self.hybrid_debug_save_dir = (
+            str(OUTPUT_DIR.parent / "debug_roi" / f"{prompt_tag}__{CONFIG_SLUG}")
+            if DEBUG_ROUTER
+            else None
         )
 
 
@@ -351,6 +385,7 @@ def main():
     print(f"Guidance scale: {GUIDANCE_SCALE}; dynamic_cfg={DYNAMIC_CFG}")
     print(f"Position-aware RoPE: {POSITION_AWARE_ROPE}")
     print(f"ROI fusion mode: {FUSION_MODE}")
+    print(f"Router debug: {DEBUG_ROUTER}; save_all_cues={DEBUG_ALL_CUES}")
     print(
         f"Dynamic switch: {DYNAMIC_SWITCH}; range={SWITCH_MIN_STEP}-{SWITCH_MAX_STEP}; "
         f"threshold={SWITCH_THRESHOLD}; patience=2"

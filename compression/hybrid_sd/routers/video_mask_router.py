@@ -216,7 +216,7 @@ class VideoMaskRouter:
             "save_debug_dir": None,
             "debug_every": 1,
             "debug_topk_frames": 5,
-            "debug_save_all_cues": True,
+            "debug_save_all_cues": False,
 
             # Backward-compatible aliases/ignored keys from the old router.
             "max_total_rois": 2,
@@ -313,7 +313,7 @@ class VideoMaskRouter:
             self.cfg_gap_map = None
 
         spatial_cue = str(self.config.get("spatial_cue", "cfg")).lower()
-        save_all_cues = bool(self.config.get("debug_save_all_cues", True))
+        save_all_cues = bool(self.config.get("debug_save_all_cues", False))
         if spatial_cue == "warp" or save_all_cues:
             self.warp_map = _compute_warp_residual(latents.detach().float(), int(self.config.get("warp_max_shift", 2)))
         else:
@@ -538,7 +538,7 @@ class VideoMaskRouter:
             debug_tensors[f"seg{rank}_spatial_score_norm"] = spatial_norm
             debug_tensors[f"seg{rank}_spatial_top_mask"] = top_mask
 
-        if bool(self.config.get("debug_save_all_cues", True)):
+        if bool(self.config.get("debug_save_all_cues", False)):
             for cue_name, cue_source in self._candidate_spatial_sources(latents).items():
                 if cue_source.shape[2:] != (h, w):
                     continue

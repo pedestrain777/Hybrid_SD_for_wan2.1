@@ -866,7 +866,8 @@ class HybridVideoInferencePipeline:
             # Debug.
             "debug_every": getattr(self.args, "hybrid_debug_every", 1),
             "debug_topk_frames": getattr(self.args, "hybrid_debug_topk_frames", 5),
-            "debug_save_all_cues": getattr(self.args, "hybrid_debug_save_all_cues", True),
+            "debug_log": getattr(self.args, "hybrid_debug_log", False),
+            "debug_save_all_cues": getattr(self.args, "hybrid_debug_save_all_cues", False),
             "save_debug_dir": getattr(self.args, "hybrid_debug_save_dir", None),
         })
         

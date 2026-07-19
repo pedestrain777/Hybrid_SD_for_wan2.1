@@ -151,6 +151,8 @@ class HybridWanPipeline(WanPipeline):
 
             "debug_every": 1,
             "debug_topk_frames": 5,
+            "debug_log": False,
+            "debug_save_all_cues": False,
             "save_debug_dir": None,
         }
         self.roi_router: VideoMaskRouter = VideoMaskRouter(self.hybrid_roi_config)
@@ -444,7 +446,7 @@ class HybridWanPipeline(WanPipeline):
         )
 
     def _log_router_debug(self, step_idx: int, debug_info: Optional[Dict[str, Any]]):
-        if debug_info is None:
+        if debug_info is None or not bool(self.hybrid_roi_config.get("debug_log", False)):
             return
 
         rois = debug_info.get("rois", [])
