@@ -6,7 +6,7 @@ import csv
 import json
 from pathlib import Path
 
-CONFIGS = ["L30H10S10", "L30H20S0", "L35H15S0"]
+CONFIGS = ["L50H0", "DYN28_38"]
 
 
 def parse_args():
@@ -82,8 +82,8 @@ def main():
     lines.append("")
     lines.append("- Prompts: 11 prompt minimal VBench subset")
     lines.append("- Videos: 1 seed/video per prompt")
-    lines.append("- Stage configs: L30H10S10=[30,10,10], L30H20S0=[30,20,0], L35H15S0=[35,15,0]")
-    lines.append("- Resolution/frames: 720x1280, 81 frames, 16 fps")
+    lines.append("- Stage configs: L50H0=[50,0], DYN28_38=dynamic large-to-hybrid switch in steps 28-38")
+    lines.append("- Resolution/frames: read from generation_times.csv (quick references may use reduced settings)")
     lines.append("- Guidance: static CFG, guidance_scale=5.0")
     lines.append("- V2 router: temporal cue=frame_diff, spatial cue=cfg, max_cubes=2")
     lines.append("- Timing: formal generation runs only; sparse debug preview is excluded")
@@ -103,27 +103,36 @@ def main():
 
     lines.append("## Generation Time")
     lines.append("")
-    lines.append("| config | videos | total_sec | mean_sec | min_sec | max_sec |")
-    lines.append("| --- | ---: | ---: | ---: | ---: | ---: |")
+    lines.append("| config | videos | total_sec | mean_sec | min_sec | max_sec | mean_switch |")
+    lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: |")
     for config in args.configs:
         elapsed = [float(row["elapsed_sec"]) for row in time_data[config] if row.get("elapsed_sec")]
         if elapsed:
+            switches = [
+                int(row["switch_step"])
+                for row in time_data[config]
+                if row.get("switch_step") not in ("", None, "None")
+            ]
+            mean_switch = f"{sum(switches)/len(switches):.1f}" if switches else ""
             lines.append(
                 f"| {config} | {len(elapsed)} | {sum(elapsed):.1f} | "
-                f"{sum(elapsed)/len(elapsed):.1f} | {min(elapsed):.1f} | {max(elapsed):.1f} |"
+                f"{sum(elapsed)/len(elapsed):.1f} | {min(elapsed):.1f} | {max(elapsed):.1f} | {mean_switch} |"
             )
         else:
-            lines.append(f"| {config} | 0 |  |  |  |  |")
+            lines.append(f"| {config} | 0 |  |  |  |  |  |")
     lines.append("")
 
     lines.append("## Per-Video Time")
     lines.append("")
-    lines.append("| config | prompt_idx | prompt | seed | elapsed_sec |")
-    lines.append("| --- | ---: | --- | ---: | ---: |")
+    lines.append("| config | prompt_idx | prompt | seed | elapsed_sec | switch_step |")
+    lines.append("| --- | ---: | --- | ---: | ---: | ---: |")
     for config in args.configs:
         for row in time_data[config]:
             prompt = row["prompt"].replace("|", "\\|")
-            lines.append(f"| {config} | {row['prompt_idx']} | {prompt} | {row['seed']} | {float(row['elapsed_sec']):.1f} |")
+            lines.append(
+                f"| {config} | {row['prompt_idx']} | {prompt} | {row['seed']} | "
+                f"{float(row['elapsed_sec']):.1f} | {row.get('switch_step', '')} |"
+            )
     lines.append("")
 
     output_md.write_text("\n".join(lines) + "\n", encoding="utf-8")

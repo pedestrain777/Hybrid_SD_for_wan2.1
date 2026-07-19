@@ -34,6 +34,8 @@ PROMPTS = [
 TEMPORAL_FLICKERING_PROMPT = "In a still frame, a stop sign"
 
 STAGE_CONFIGS = {
+    "L50H0": [50, 0],
+    "DYN28_38": [30, 20],
     "L50H0S0": [50, 0, 0],
     "L30H10S10": [30, 10, 10],
     "L30H20S0": [30, 20, 0],
@@ -69,6 +71,7 @@ CSV_FIELDS = [
     "fps",
     "guidance_scale",
     "dynamic_cfg",
+    "switch_step",
     "debug",
     "timed",
     "elapsed_sec",
@@ -130,7 +133,7 @@ def append_csv(path: Path, row: dict):
 
 
 class Args:
-    def __init__(self, stage_steps, debug_dir=None, debug_every=5, debug_topk_frames=3, debug_save_all_cues=False):
+    def __init__(self, config_name, stage_steps, debug_dir=None, debug_every=5, debug_topk_frames=3, debug_save_all_cues=False):
         self.enable_xformers_memory_efficient_attention = False
         self.use_dpm_solver = True
         self.logger = None
@@ -156,6 +159,16 @@ class Args:
         self.hybrid_min_crop_w = 8
         self.hybrid_align_h = 2
         self.hybrid_align_w = 2
+        self.hybrid_position_aware_rope = True
+        self.hybrid_fusion_mode = "feather"
+        self.hybrid_feather_t = 1
+        self.hybrid_feather_h = 2
+        self.hybrid_feather_w = 2
+        self.hybrid_dynamic_switch = config_name == "DYN28_38"
+        self.hybrid_dynamic_switch_min_step = 28
+        self.hybrid_dynamic_switch_max_step = 38
+        self.hybrid_dynamic_switch_threshold = 0.20
+        self.hybrid_dynamic_switch_patience = 2
 
         self.hybrid_debug_every = debug_every
         self.hybrid_debug_topk_frames = debug_topk_frames
@@ -204,6 +217,7 @@ def main():
 
         print(f"\n[{config_name}] stage_steps={stage_steps}: loading pipeline...")
         pipe_args = Args(
+            config_name,
             stage_steps,
             debug_dir=str(debug_root) if args.debug else None,
             debug_every=args.debug_every,
@@ -278,7 +292,11 @@ def main():
                     frames = extract_frames(out)
                     export_to_video(frames, str(output_path), fps=args.fps)
                     elapsed = time.time() - t0
-                    row.update({"status": "ok", "elapsed_sec": f"{elapsed:.3f}"})
+                    row.update({
+                        "status": "ok",
+                        "elapsed_sec": f"{elapsed:.3f}",
+                        "switch_step": pipe.pipe.dynamic_switch_step,
+                    })
                     print(f"    saved: {output_path} | time={elapsed:.1f}s")
                 except Exception as exc:
                     elapsed = time.time() - t0

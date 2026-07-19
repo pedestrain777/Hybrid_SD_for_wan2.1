@@ -18,7 +18,7 @@ DIMENSIONS = [
     "overall_consistency",
 ]
 
-CONFIGS = ["L30H10S10", "L30H20S0", "L35H15S0"]
+CONFIGS = ["L50H0", "DYN28_38"]
 
 
 def parse_args():
