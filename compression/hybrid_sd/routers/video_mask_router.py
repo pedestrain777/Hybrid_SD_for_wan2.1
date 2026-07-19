@@ -9,15 +9,17 @@ import torch.nn.functional as F
 
 
 def _topk_binary_mask(scores: torch.Tensor, ratio: float) -> torch.Tensor:
-    """Return a per-sample top-ratio mask."""
+    """Return an exact per-sample top-ratio mask, including when scores tie."""
     ratio = float(max(0.0, min(1.0, ratio)))
     bsz = scores.shape[0]
     flat = scores.reshape(bsz, -1)
     total = flat.shape[1]
-    k = max(1, min(total, int(math.ceil(total * ratio))))
-    vals = torch.topk(flat, k=k, dim=1).values
-    thr = vals[:, -1].view(bsz, *([1] * (scores.ndim - 1)))
-    return scores >= thr
+    k = min(total, int(math.ceil(total * ratio)))
+    mask = torch.zeros_like(flat, dtype=torch.bool)
+    if k > 0:
+        top_indices = torch.topk(flat, k=k, dim=1, sorted=False).indices
+        mask.scatter_(1, top_indices, True)
+    return mask.reshape_as(scores)
 
 
 def _normalize_2d(x: torch.Tensor) -> torch.Tensor:
@@ -386,7 +388,7 @@ class VideoMaskRouter:
         t_len: int,
         h: int,
         w: int,
-    ) -> Tuple[Dict[str, Any], Dict[str, Any], torch.Tensor, torch.Tensor]:
+    ) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any], torch.Tensor, torch.Tensor]:
         s, e = segment
         # Average the chosen spatial cue inside the hard temporal segment.
         spatial_2d = spatial_source[0, s:e].mean(dim=0)
@@ -401,6 +403,23 @@ class VideoMaskRouter:
             spatial_norm.unsqueeze(0),
             ratio=float(self.config.get("spatial_top_ratio", 0.08)),
         )[0]
+        # A flat cue contains no evidence for where the large model is needed.
+        # Running a full-frame crop here would silently violate the ROI budget;
+        # use the already-computed full small-model prediction for this segment.
+        cue_range = float((spatial_2d.max() - spatial_2d.min()).abs().item())
+        if cue_range <= 1e-8 or not top_mask.any():
+            entry = {
+                "seg_rank": int(seg_rank),
+                "segment": [int(s), int(e)],
+                "seg_score": float(seg_score),
+                "spatial_bbox": None,
+                "bbox_source": "skip_flat_or_empty_cue",
+                "num_components": 0,
+                "spatial_score_mean": float(spatial_norm.mean().item()),
+                "spatial_score_max": float(spatial_norm.max().item()),
+                "mask_ratio": 0.0,
+            }
+            return None, entry, spatial_norm.detach().cpu(), top_mask.detach().cpu()
         if min(h, w) >= 3:
             top_mask = F.max_pool2d(top_mask.float()[None, None], kernel_size=3, stride=1, padding=1)[0, 0] > 0
 
@@ -458,16 +477,15 @@ class VideoMaskRouter:
         temporal_score = frame_diff_map.mean(dim=(2, 3))           # [B,T]
 
         if t_len <= 1 or float(temporal_score.max().item()) <= 1e-8:
-            segments = [(0, t_len)]
-            temporal_mask = torch.ones((1, t_len), device=latents.device, dtype=torch.bool)
+            # No temporal evidence means no large-model crop, not a full-video crop.
+            segments = []
+            temporal_mask = torch.zeros((1, t_len), device=latents.device, dtype=torch.bool)
         else:
             temporal_mask = _topk_binary_mask(
                 temporal_score,
                 ratio=float(self.config.get("temporal_top_ratio", 0.15)),
             )
             segments = _bool_to_segments(temporal_mask[0])
-            if not segments:
-                segments = [(0, t_len)]
 
         segment_scores: List[Tuple[float, int, int]] = []
         for s, e in segments:
@@ -476,7 +494,8 @@ class VideoMaskRouter:
 
         max_segments = int(self.config.get("max_temporal_segments", self.config.get("max_segments", 2)))
         max_cubes = int(self.config.get("max_cubes", self.config.get("max_total_rois", 2)))
-        selected_segments = segment_scores[: max(1, min(max_segments, max_cubes, len(segment_scores)))]
+        selection_limit = max(0, min(max_segments, max_cubes, len(segment_scores)))
+        selected_segments = segment_scores[:selection_limit]
 
         spatial_name, spatial_source = self._select_spatial_source(latents)
         spatial_source = spatial_source.float()
@@ -497,7 +516,8 @@ class VideoMaskRouter:
                 h=h,
                 w=w,
             )
-            rois.append(roi)
+            if roi is not None:
+                rois.append(roi)
             spatial_debug.append(entry)
             debug_tensors[f"seg{rank}_spatial_score_norm"] = spatial_norm
             debug_tensors[f"seg{rank}_spatial_top_mask"] = top_mask
@@ -522,9 +542,6 @@ class VideoMaskRouter:
                     candidate_spatial_debug[cue_name].append(cand_entry)
                     debug_tensors[f"candidate_{cue_name}_seg{rank}_spatial_score_norm"] = cand_score
                     debug_tensors[f"candidate_{cue_name}_seg{rank}_spatial_top_mask"] = cand_mask
-
-        if not rois:
-            rois = [self._make_roi(t_len, h, w, 0, t_len, 0, h, 0, w)]
 
         # Sort for deterministic crop order and keep a copy for external debug tools.
         rois = sorted(rois, key=lambda r: (r["core_t0"], r["core_y0"], r["core_x0"]))

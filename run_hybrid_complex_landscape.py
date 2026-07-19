@@ -6,8 +6,8 @@ Hybrid SD Wan2.1 14B+1.3B - Complex Landscape 生成
   python run_hybrid_complex_landscape.py <gpu_id>                    # 默认 prompts 第 0 行、默认步数
   python run_hybrid_complex_landscape.py <gpu_id> <prompt_idx>       # 文件第 prompt_idx 行
   python run_hybrid_complex_landscape.py <gpu_id> "黑色小狗在跑步"    # 自定义 prompt
-  python run_hybrid_complex_landscape.py 0 --stages 40,10 "黑色小狗"  # 40 步 large + 0 hybrid + 10 small
-  python run_hybrid_complex_landscape.py 0 --stages 30,0,20 "提示"   # 显式三段
+  python run_hybrid_complex_landscape.py 0 --stages 30,20 "黑色小狗"  # 30 步 large + 20 步 hybrid
+  python run_hybrid_complex_landscape.py 0 --stages 30,10,10 "提示"  # 旧三段 baseline 兼容格式
 
 输出 mp4 命名: {prompt}__{CONFIG_SLUG}.mp4
   CONFIG_SLUG 含 L?H?S?、seed、帧数、高x宽、guidance、fps；同路径重跑会覆盖，不再因「已存在」跳过。
@@ -22,7 +22,7 @@ from pathlib import Path
 
 PROMPT_FILE = "/data/chenjiayu/minyu_lee/EC-Diff-main_for_v2i/prompts_complex_landscape.txt"
 
-DEFAULT_STAGE_STEPS = [30, 10, 10]
+DEFAULT_STAGE_STEPS = [30, 20]
 
 
 def _load_prompts():
@@ -33,12 +33,12 @@ def _load_prompts():
 def _parse_stages_str(s: str) -> list:
     parts = [int(x.strip()) for x in s.split(",") if x.strip()]
     if len(parts) == 2:
-        return [parts[0], 0, parts[1]]
+        return parts
     if len(parts) == 3:
         return parts
     raise SystemExit(
-        f"--stages / 环境变量 格式错误: {s!r}，需要两个数 large,small（无 hybrid）"
-        f"或三个数 large,hybrid,small，例如 40,10 或 30,10,10"
+        f"--stages / 环境变量 格式错误: {s!r}，需要两个数 large,hybrid，"
+        f"或旧 baseline 的三个数 large,hybrid,small，例如 30,20 或 30,10,10"
     )
 
 
@@ -79,8 +79,8 @@ def _parse_cli():
     parser.add_argument(
         "--stages",
         default=None,
-        metavar="L,S",
-        help="两数: large,small（hybrid 固定为 0），如 40,10；三数: large,hybrid,small，如 30,10,10。也可用环境变量 WAN_HYBRID_STAGE_STEPS",
+        metavar="L,H",
+        help="两数: large,hybrid，如 30,20；三数仅用于旧 baseline 兼容: large,hybrid,small。也可用环境变量 WAN_HYBRID_STAGE_STEPS",
     )
     parser.add_argument(
         "--spatial-cue",
@@ -171,7 +171,10 @@ def _parse_cli():
 _ns = _parse_cli()
 gpu_id = _ns.gpu
 STAGE_STEPS = _resolve_stage_steps(_ns.stages)
-_stage_slug = f"L{STAGE_STEPS[0]}H{STAGE_STEPS[1]}S{STAGE_STEPS[2]}"
+if len(STAGE_STEPS) == 2:
+    _stage_slug = f"L{STAGE_STEPS[0]}H{STAGE_STEPS[1]}"
+else:
+    _stage_slug = f"L{STAGE_STEPS[0]}H{STAGE_STEPS[1]}S{STAGE_STEPS[2]}"
 SPATIAL_CUE = _ns.spatial_cue
 TEMPORAL_TOP_RATIO = _ns.temporal_top_ratio
 SPATIAL_TOP_RATIO = _ns.spatial_top_ratio
@@ -292,7 +295,7 @@ def main():
     print("=" * 60)
     print(f"云侧模型: {MODEL_PATHS[0]}")
     print(f"边缘模型: {MODEL_PATHS[1]}")
-    print(f"三阶段步数 [large, hybrid, small]: {STAGE_STEPS}  (slug={_stage_slug})")
+    print(f"阶段步数 [large, hybrid]（三段仅作旧 baseline 兼容）: {STAGE_STEPS}  (slug={_stage_slug})")
     print(f"Hybrid spatial cue: {SPATIAL_CUE}; temporal_top_ratio={TEMPORAL_TOP_RATIO}; spatial_top_ratio={SPATIAL_TOP_RATIO}; max_cubes={MAX_CUBES}")
     print(f"配置标签 CONFIG_SLUG: {CONFIG_SLUG}")
     print(f"Seed: {SEED}")

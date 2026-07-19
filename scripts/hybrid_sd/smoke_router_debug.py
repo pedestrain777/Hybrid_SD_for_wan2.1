@@ -11,7 +11,7 @@ import torch
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from compression.hybrid_sd.routers.video_mask_router import VideoMaskRouter
+from compression.hybrid_sd.routers.video_mask_router import VideoMaskRouter, _topk_binary_mask
 
 
 def _bbox_iou(a, b):
@@ -25,12 +25,35 @@ def _bbox_iou(a, b):
     return inter / max(1, area_a + area_b - inter)
 
 
+def _assert_budget_regressions():
+    flat_scores = torch.zeros(1, 10, 10)
+    selected = _topk_binary_mask(flat_scores, ratio=0.08)
+    if int(selected.sum().item()) != 8:
+        raise SystemExit(f"exact top-k regression: expected 8 positions, got {int(selected.sum().item())}")
+
+    zero_latents = torch.zeros(1, 4, 9, 16, 16)
+    zero_cfg = torch.zeros(1, 9, 16, 16)
+    zero_router = VideoMaskRouter({
+        "spatial_cue": "cfg",
+        "temporal_top_ratio": 0.15,
+        "spatial_top_ratio": 0.08,
+        "debug_save_all_cues": False,
+    })
+    zero_router.observe_aux(zero_latents, cfg_gap_map=zero_cfg, step_idx=0)
+    zero_rois, zero_debug = zero_router.build_rois(zero_latents, step_idx=0)
+    if zero_rois or zero_debug["core_ratio"] != 0.0 or zero_debug["outer_ratio"] != 0.0:
+        raise SystemExit(f"flat-cue regression: expected no ROI, got {zero_rois}")
+    print("budget regressions: exact top-k and flat-cue fallback passed")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--out-dir", default="router_debug_smoke")
     parser.add_argument("--min-iou", type=float, default=0.45)
     parser.add_argument("--keep", action="store_true")
     args = parser.parse_args()
+
+    _assert_budget_regressions()
 
     out_dir = Path(args.out_dir)
     if out_dir.exists() and not args.keep:

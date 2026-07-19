@@ -885,10 +885,11 @@ class HybridVideoInferencePipeline:
     
     def get_step_config(self, args):
         """
-        三阶段配置：
+        主流程为二阶段配置：
         - large:  只用大模型
         - hybrid: 小模型 full + router ROI + 大模型仅跑 crop 并回填 core
-        - small:  只用小模型
+
+        为复现实验保留旧三段 [large, hybrid, small] 输入兼容性，主入口默认不使用 small-only。
 
         返回:
             total_step
@@ -907,10 +908,16 @@ class HybridVideoInferencePipeline:
         else:
             stage_steps = args.steps
 
-        assert len(stage_steps) == 3, \
-            f"现在必须传 3 段 steps，例如 [10,25,15]，当前得到: {stage_steps}"
+        assert len(stage_steps) in (2, 3), \
+            f"主流程传 2 段 [large,hybrid]；旧 baseline 可传 3 段，当前得到: {stage_steps}"
 
-        large_steps, hybrid_steps, small_steps = stage_steps
+        if len(stage_steps) == 2:
+            large_steps, hybrid_steps = stage_steps
+            small_steps = 0
+        else:
+            large_steps, hybrid_steps, small_steps = stage_steps
+        assert min(large_steps, hybrid_steps, small_steps) >= 0, f"stage steps 必须非负: {stage_steps}"
+        assert large_steps + hybrid_steps + small_steps > 0, f"stage steps 总和必须大于 0: {stage_steps}"
 
         step_config = {
             "step": {},
