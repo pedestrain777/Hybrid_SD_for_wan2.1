@@ -924,12 +924,39 @@ class HybridVideoInferencePipeline:
         assert min(large_steps, hybrid_steps, small_steps) >= 0, f"stage steps 必须非负: {stage_steps}"
         assert large_steps + hybrid_steps + small_steps > 0, f"stage steps 总和必须大于 0: {stage_steps}"
 
+        requested_total_step = large_steps + hybrid_steps + small_steps
+        dynamic_switch = bool(
+            getattr(args, "hybrid_dynamic_switch", False)
+            and len(stage_steps) == 2
+            and hybrid_steps > 0
+        )
+        dynamic_min_step = int(getattr(args, "hybrid_dynamic_switch_min_step", 28))
+        dynamic_max_step = int(getattr(args, "hybrid_dynamic_switch_max_step", 38))
+        if dynamic_switch:
+            assert len(stage_steps) == 2, "dynamic switch 只支持二阶段 [large,hybrid]"
+            assert 1 <= dynamic_min_step <= dynamic_max_step < requested_total_step, (
+                "dynamic switch 需要满足 1 <= min_step <= max_step < total_step，"
+                f"当前为 {dynamic_min_step}, {dynamic_max_step}, total={requested_total_step}"
+            )
+            large_steps = dynamic_max_step
+            hybrid_steps = requested_total_step - dynamic_max_step
+            small_steps = 0
+
         step_config = {
             "step": {},
             "mode": {},
             "name": {},
             "large_index": 0,
             "small_index": 1,
+            "dynamic_switch": dynamic_switch,
+            "dynamic_switch_min_step": dynamic_min_step,
+            "dynamic_switch_max_step": dynamic_max_step,
+            "dynamic_switch_threshold": float(
+                getattr(args, "hybrid_dynamic_switch_threshold", 0.20)
+            ),
+            "dynamic_switch_patience": int(
+                getattr(args, "hybrid_dynamic_switch_patience", 2)
+            ),
         }
 
         total_step = 0

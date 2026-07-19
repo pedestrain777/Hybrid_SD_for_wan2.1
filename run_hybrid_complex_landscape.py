@@ -120,6 +120,21 @@ def _parse_cli():
         help="大模型 ROI 回填方式；feather 仅增加逐元素融合，无额外模型推理。",
     )
     parser.add_argument(
+        "--fixed-switch",
+        dest="dynamic_switch",
+        action="store_false",
+        default=True,
+        help="关闭默认动态切换，严格使用 --stages 中的 fixed large 步数。",
+    )
+    parser.add_argument("--switch-min-step", type=int, default=28)
+    parser.add_argument("--switch-max-step", type=int, default=38)
+    parser.add_argument(
+        "--switch-threshold",
+        type=float,
+        default=float(os.environ.get("WAN_HYBRID_SWITCH_THRESHOLD", 0.20)),
+        help="连续 clean-sample 相对 RMSE 的动态切换阈值。",
+    )
+    parser.add_argument(
         "--guidance-scale",
         type=float,
         default=float(os.environ.get("WAN_HYBRID_GUIDANCE_SCALE", 5.0)),
@@ -184,8 +199,16 @@ def _parse_cli():
 _ns = _parse_cli()
 gpu_id = _ns.gpu
 STAGE_STEPS = _resolve_stage_steps(_ns.stages)
+DYNAMIC_SWITCH = bool(
+    _ns.dynamic_switch and len(STAGE_STEPS) == 2 and STAGE_STEPS[1] > 0
+)
+SWITCH_MIN_STEP = int(_ns.switch_min_step)
+SWITCH_MAX_STEP = int(_ns.switch_max_step)
+SWITCH_THRESHOLD = float(_ns.switch_threshold)
 if len(STAGE_STEPS) == 2:
     _stage_slug = f"L{STAGE_STEPS[0]}H{STAGE_STEPS[1]}"
+    if DYNAMIC_SWITCH:
+        _stage_slug += f"_dyn{SWITCH_MIN_STEP}-{SWITCH_MAX_STEP}t{SWITCH_THRESHOLD:g}"
 else:
     _stage_slug = f"L{STAGE_STEPS[0]}H{STAGE_STEPS[1]}S{STAGE_STEPS[2]}"
 SPATIAL_CUE = _ns.spatial_cue
@@ -296,6 +319,11 @@ class Args:
         self.hybrid_feather_t = 1
         self.hybrid_feather_h = 2
         self.hybrid_feather_w = 2
+        self.hybrid_dynamic_switch = DYNAMIC_SWITCH
+        self.hybrid_dynamic_switch_min_step = SWITCH_MIN_STEP
+        self.hybrid_dynamic_switch_max_step = SWITCH_MAX_STEP
+        self.hybrid_dynamic_switch_threshold = SWITCH_THRESHOLD
+        self.hybrid_dynamic_switch_patience = 2
 
         # Debug 保存
         self.hybrid_debug_every = 1
@@ -323,6 +351,10 @@ def main():
     print(f"Guidance scale: {GUIDANCE_SCALE}; dynamic_cfg={DYNAMIC_CFG}")
     print(f"Position-aware RoPE: {POSITION_AWARE_ROPE}")
     print(f"ROI fusion mode: {FUSION_MODE}")
+    print(
+        f"Dynamic switch: {DYNAMIC_SWITCH}; range={SWITCH_MIN_STEP}-{SWITCH_MAX_STEP}; "
+        f"threshold={SWITCH_THRESHOLD}; patience=2"
+    )
     print(f"输出: {output_path}")
     args = Args()
     print(f"ROI debug 目录: {args.hybrid_debug_save_dir}")

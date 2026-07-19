@@ -118,6 +118,9 @@ class HybridWanPipeline(WanPipeline):
         
         # Per-model timing tracking
         self._model_timing_run: Dict[str, float] = {}
+        self.dynamic_switch_trace: List[Dict[str, Any]] = []
+        self.dynamic_switch_step: Optional[int] = None
+        self._dynamic_switch_previous_x0: Optional[torch.Tensor] = None
 
         # Simplified Hybrid stage = Full-small denoising + Large cube correction.
         # Time routing uses frame-wise latent difference; spatial routing uses one selected cue.
@@ -282,6 +285,60 @@ class HybridWanPipeline(WanPipeline):
     def _reset_hybrid_state(self):
         if hasattr(self, "roi_router") and self.roi_router is not None:
             self.roi_router.reset()
+        self.dynamic_switch_trace = []
+        self.dynamic_switch_step = None
+        self._dynamic_switch_previous_x0 = None
+
+    def _dynamic_switch_enabled(self) -> bool:
+        return bool(self.step_config and self.step_config.get("dynamic_switch", False))
+
+    def _update_dynamic_switch(
+        self,
+        step_idx: int,
+        latents: torch.Tensor,
+        noise_pred: torch.Tensor,
+        sigma,
+    ) -> None:
+        """Switch after a stable large-model clean-sample estimate, with hard 1-based bounds."""
+        if not self._dynamic_switch_enabled() or self.dynamic_switch_step is not None:
+            return
+
+        step_number = int(step_idx) + 1
+        sigma_value = float(sigma.item()) if isinstance(sigma, torch.Tensor) else float(sigma)
+        x0 = latents.detach().float() - sigma_value * noise_pred.detach().float()
+        relative_rmse = None
+        if self._dynamic_switch_previous_x0 is not None:
+            previous = self._dynamic_switch_previous_x0
+            relative_rmse = float(
+                ((x0 - previous).square().mean().sqrt() / previous.square().mean().sqrt().clamp_min(1e-8)).item()
+            )
+        self._dynamic_switch_previous_x0 = x0
+
+        self.dynamic_switch_trace.append({
+            "step": step_number,
+            "sigma": sigma_value,
+            "x0_relative_rmse": relative_rmse,
+        })
+
+        min_step = int(self.step_config.get("dynamic_switch_min_step", 28))
+        max_step = int(self.step_config.get("dynamic_switch_max_step", 38))
+        threshold = float(self.step_config.get("dynamic_switch_threshold", 0.20))
+        patience = max(1, int(self.step_config.get("dynamic_switch_patience", 2)))
+        recent = [row["x0_relative_rmse"] for row in self.dynamic_switch_trace[-patience:]]
+        stable = (
+            step_number >= min_step
+            and len(recent) == patience
+            and all(value is not None and value <= threshold for value in recent)
+        )
+        forced = step_number >= max_step
+        if stable or forced:
+            self.dynamic_switch_step = step_number
+            self._dynamic_switch_previous_x0 = None
+            reason = "stable" if stable else "max_step"
+            print(
+                f"[Dynamic Switch] large->hybrid after step {step_number}: "
+                f"reason={reason}, recent_x0_relative_rmse={recent}, threshold={threshold:.4f}"
+            )
 
     def _predict_noise_cfg(
         self,
@@ -1270,6 +1327,8 @@ class HybridWanPipeline(WanPipeline):
 
                 latents_before_step = latents.detach().float()
                 mode = self.step_config["mode"].get(i, "large")
+                if self._dynamic_switch_enabled():
+                    mode = "hybrid" if self.dynamic_switch_step is not None else "large"
                 model_index = self.step_config["step"][i]
                 large_index = self.step_config.get("large_index", 0)
                 small_index = self.step_config.get("small_index", 1)
@@ -1333,6 +1392,13 @@ class HybridWanPipeline(WanPipeline):
                         t=t,
                         attention_kwargs=attention_kwargs,
                     )
+                    if self._dynamic_switch_enabled():
+                        self._update_dynamic_switch(
+                            step_idx=i,
+                            latents=latents_before_step,
+                            noise_pred=noise_pred,
+                            sigma=self.scheduler.sigmas[i],
+                        )
                 elif mode == "small":
                     selected_transformer = self.transformers[small_index]
                     noise_pred, model_time_cond, model_time_cfg = self._predict_noise_cfg(
