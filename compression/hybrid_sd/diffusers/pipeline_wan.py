@@ -19,9 +19,9 @@ Supports switching between multiple transformers (e.g., Wan2.1-14B and Wan2.1-1.
 """
 
 import inspect
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 import warnings
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import os
 import math
 import time as time_module
@@ -140,6 +140,7 @@ class HybridWanPipeline(WanPipeline):
             "min_crop_w": 8,
             "align_h": 2,
             "align_w": 2,
+            "position_aware_rope": True,
 
             "debug_every": 1,
             "debug_topk_frames": 5,
@@ -217,6 +218,63 @@ class HybridWanPipeline(WanPipeline):
         self._sync_cuda_if_needed(*refs)
         return time_module.perf_counter() - start_t
 
+    @staticmethod
+    def _wan_rotary_emb_with_offset(rope, hidden_states: torch.Tensor, position_offset):
+        """Build Wan 3D RoPE on the full-video patch grid for a local latent crop."""
+        _, _, num_frames, height, width = hidden_states.shape
+        p_t, p_h, p_w = rope.patch_size
+        off_t, off_h, off_w = (int(x) for x in position_offset)
+        if off_t % p_t or off_h % p_h or off_w % p_w:
+            raise ValueError(
+                f"ROI origin {position_offset} is not aligned to Wan patch_size={rope.patch_size}"
+            )
+
+        ppf, pph, ppw = num_frames // p_t, height // p_h, width // p_w
+        start_f, start_h, start_w = off_t // p_t, off_h // p_h, off_w // p_w
+        split_sizes = [rope.t_dim, rope.h_dim, rope.w_dim]
+        freqs_cos = rope.freqs_cos.split(split_sizes, dim=1)
+        freqs_sin = rope.freqs_sin.split(split_sizes, dim=1)
+
+        if (
+            start_f + ppf > freqs_cos[0].shape[0]
+            or start_h + pph > freqs_cos[1].shape[0]
+            or start_w + ppw > freqs_cos[2].shape[0]
+        ):
+            raise ValueError(
+                f"ROI RoPE range exceeds table: offset={position_offset}, "
+                f"post_patch_shape={(ppf, pph, ppw)}"
+            )
+
+        cos_f = freqs_cos[0][start_f : start_f + ppf].view(ppf, 1, 1, -1).expand(ppf, pph, ppw, -1)
+        cos_h = freqs_cos[1][start_h : start_h + pph].view(1, pph, 1, -1).expand(ppf, pph, ppw, -1)
+        cos_w = freqs_cos[2][start_w : start_w + ppw].view(1, 1, ppw, -1).expand(ppf, pph, ppw, -1)
+        sin_f = freqs_sin[0][start_f : start_f + ppf].view(ppf, 1, 1, -1).expand(ppf, pph, ppw, -1)
+        sin_h = freqs_sin[1][start_h : start_h + pph].view(1, pph, 1, -1).expand(ppf, pph, ppw, -1)
+        sin_w = freqs_sin[2][start_w : start_w + ppw].view(1, 1, ppw, -1).expand(ppf, pph, ppw, -1)
+
+        rotary_cos = torch.cat([cos_f, cos_h, cos_w], dim=-1).reshape(1, ppf * pph * ppw, 1, -1)
+        rotary_sin = torch.cat([sin_f, sin_h, sin_w], dim=-1).reshape(1, ppf * pph * ppw, 1, -1)
+        return rotary_cos, rotary_sin
+
+    @contextmanager
+    def _wan_rope_offset_context(self, transformer, position_offset):
+        if position_offset is None or not any(int(x) for x in position_offset):
+            yield
+            return
+        rope = getattr(transformer, "rope", None)
+        if rope is None:
+            raise AttributeError("position-aware ROI inference requires transformer.rope")
+        original_forward = rope.forward
+
+        def offset_forward(hidden_states):
+            return self._wan_rotary_emb_with_offset(rope, hidden_states, position_offset)
+
+        rope.forward = offset_forward
+        try:
+            yield
+        finally:
+            rope.forward = original_forward
+
     def _reset_hybrid_state(self):
         if hasattr(self, "roi_router") and self.roi_router is not None:
             self.roi_router.reset()
@@ -234,6 +292,7 @@ class HybridWanPipeline(WanPipeline):
         t,
         attention_kwargs: Optional[Dict[str, Any]],
         return_aux: bool = False,
+        position_offset: Optional[Tuple[int, int, int]] = None,
     ):
         t0 = self._perf_counter_sync(latent_model_input)
         cond_cache_context = (
@@ -241,7 +300,7 @@ class HybridWanPipeline(WanPipeline):
             if hasattr(transformer, "cache_context")
             else nullcontext()
         )
-        with cond_cache_context:
+        with cond_cache_context, self._wan_rope_offset_context(transformer, position_offset):
             noise_cond = transformer(
                 hidden_states=latent_model_input,
                 encoder_hidden_states=prompt_embeds,
@@ -279,7 +338,7 @@ class HybridWanPipeline(WanPipeline):
             if hasattr(transformer, "cache_context")
             else nullcontext()
         )
-        with uncond_cache_context:
+        with uncond_cache_context, self._wan_rope_offset_context(transformer, position_offset):
             noise_uncond = transformer(
                 hidden_states=latent_model_input,
                 encoder_hidden_states=negative_prompt_embeds,
@@ -626,6 +685,9 @@ class HybridWanPipeline(WanPipeline):
                     continue
 
                 t0_crop = self._perf_counter_sync(crop_input)
+                position_offset = None
+                if bool(self.hybrid_roi_config.get("position_aware_rope", True)):
+                    position_offset = (roi["t0"], roi["y0"], roi["x0"])
                 noise_large_crop, large_cond, large_cfg = self._predict_noise_cfg(
                     transformer=self.transformers[large_index],
                     latent_model_input=crop_input,
@@ -637,6 +699,7 @@ class HybridWanPipeline(WanPipeline):
                     num_inference_steps=num_inference_steps,
                     t=t,
                     attention_kwargs=attention_kwargs,
+                    position_offset=position_offset,
                 )
                 crop_time = self._elapsed_sync(t0_crop, noise_large_crop)
 

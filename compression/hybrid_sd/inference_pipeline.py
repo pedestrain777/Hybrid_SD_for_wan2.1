@@ -857,6 +857,7 @@ class HybridVideoInferencePipeline:
             "min_crop_w": getattr(self.args, "hybrid_min_crop_w", 8),
             "align_h": getattr(self.args, "hybrid_align_h", 2),
             "align_w": getattr(self.args, "hybrid_align_w", 2),
+            "position_aware_rope": getattr(self.args, "hybrid_position_aware_rope", True),
 
             # Debug.
             "debug_every": getattr(self.args, "hybrid_debug_every", 1),

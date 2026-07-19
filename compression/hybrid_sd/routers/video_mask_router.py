@@ -144,18 +144,34 @@ def _compute_warp_residual(latents: torch.Tensor, max_shift: int) -> torch.Tenso
 
 
 def _expand_align_bounds(start: int, end: int, limit: int, margin: int, min_size: int, align: int) -> Tuple[int, int]:
-    start = max(0, int(start) - int(margin))
-    end = min(int(limit), int(end) + int(margin))
-    if end <= start:
-        end = min(int(limit), start + 1)
-    size = max(end - start, int(min_size))
-    if align > 1:
-        size = int(math.ceil(size / int(align)) * int(align))
-    size = min(size, int(limit))
-    center = 0.5 * (start + end)
-    new_start = int(round(center - size / 2.0))
-    new_start = max(0, min(new_start, int(limit) - size))
-    return new_start, new_start + size
+    limit = int(limit)
+    align = max(1, int(align))
+    if limit <= 0:
+        return 0, 0
+    if align > 1 and limit % align != 0:
+        raise ValueError(f"ROI axis limit={limit} must be divisible by patch alignment={align}")
+
+    required_start = max(0, int(start) - int(margin))
+    required_end = min(limit, int(end) + int(margin))
+    if required_end <= required_start:
+        required_end = min(limit, required_start + 1)
+
+    # Both the crop size and crop origin must use the full-model patch grid.
+    aligned_start = (required_start // align) * align
+    aligned_end = min(limit, int(math.ceil(required_end / align)) * align)
+    required_size = aligned_end - aligned_start
+    target_size = max(required_size, int(min_size))
+    target_size = min(limit, int(math.ceil(target_size / align)) * align)
+
+    center = 0.5 * (aligned_start + aligned_end)
+    new_start = int(math.floor((center - target_size / 2.0) / align)) * align
+    new_start = max(0, min(new_start, limit - target_size))
+    if new_start > aligned_start:
+        new_start = aligned_start
+    if new_start + target_size < aligned_end:
+        new_start = aligned_end - target_size
+    new_start = max(0, min(new_start, limit - target_size))
+    return new_start, new_start + target_size
 
 
 class VideoMaskRouter:
