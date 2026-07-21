@@ -1,0 +1,25 @@
+[
+  {"category": "static_or_simple_motion", "prompt": "In a still frame, a stop sign"},
+  {"category": "static_or_simple_motion", "prompt": "a laptop, frozen in time"},
+  {"category": "static_or_simple_motion", "prompt": "A tranquil tableau of alley"},
+  {"category": "static_or_simple_motion", "prompt": "In a still frame, parking lot"},
+  {"category": "static_or_simple_motion", "prompt": "A tranquil tableau of a wooden bench in the park"},
+
+  {"category": "fast_motion", "prompt": "a bicycle accelerating to gain speed"},
+  {"category": "fast_motion", "prompt": "an airplane taking off"},
+  {"category": "fast_motion", "prompt": "a train speeding down the tracks"},
+  {"category": "fast_motion", "prompt": "a motorcycle accelerating to gain speed"},
+  {"category": "fast_motion", "prompt": "a car turning a corner"},
+
+  {"category": "multiple_object_interaction", "prompt": "a bird and a cat"},
+  {"category": "multiple_object_interaction", "prompt": "a cat and a dog"},
+  {"category": "multiple_object_interaction", "prompt": "an airplane and a train"},
+  {"category": "multiple_object_interaction", "prompt": "a bicycle on the left of a car, front view"},
+  {"category": "multiple_object_interaction", "prompt": "a bird on the left of a cat, front view"},
+
+  {"category": "human_action_and_deformation", "prompt": "A person is riding a bike"},
+  {"category": "human_action_and_deformation", "prompt": "A person is roller skating"},
+  {"category": "human_action_and_deformation", "prompt": "A person is wrestling"},
+  {"category": "human_action_and_deformation", "prompt": "A person is dunking basketball"},
+  {"category": "human_action_and_deformation", "prompt": "A person is skydiving"}
+]
