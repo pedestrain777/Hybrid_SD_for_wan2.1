@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -16,6 +17,20 @@ DIMENSIONS = [
     "spatial_relationship",
     "human_action",
 ]
+
+
+def install_timm_compatibility():
+    """Drop timm factory-only kwargs before VBench's legacy UMT constructor."""
+    from timm.models import _registry
+    from vbench.third_party.umt.models import modeling_finetune
+
+    original = modeling_finetune.vit_large_patch16_224
+
+    def compatible_vit_large_patch16_224(pretrained=False, **kwargs):
+        kwargs.pop("cache_dir", None)
+        return original(pretrained=pretrained, **kwargs)
+
+    _registry._model_entrypoints["vit_large_patch16_224"] = compatible_vit_large_patch16_224
 
 
 def threshold_tag(value: float) -> str:
@@ -65,9 +80,13 @@ def main():
         repo_root / "vbench1_minimal_v2_pack" / "threshold_ablation_manifest.json",
         subset_path,
     )
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
     sys.path.insert(0, str(vbench_root))
     import torch
     from vbench import VBench
+
+    install_timm_compatibility()
 
     output_root.mkdir(parents=True, exist_ok=True)
     benchmark = VBench(torch.device(args.device), str(subset_path), str(output_root))

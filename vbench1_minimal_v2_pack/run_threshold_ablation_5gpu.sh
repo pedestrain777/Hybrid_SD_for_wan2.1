@@ -35,17 +35,26 @@ run_one_threshold() {
   local gpu="$2"
   local tag="tau_${threshold/./p}"
   local log_path="${results_root}/logs/${tag}_gpu${gpu}.log"
+  local completed=0
 
   wait_for_idle_gpu "${gpu}" >>"${log_path}" 2>&1
-  echo "$(date -Is) starting generation threshold=${threshold} gpu=${gpu}" >>"${log_path}"
-  "${generation_python}" "${repo_root}/vbench1_minimal_v2_pack/run_threshold_ablation_generate.py" \
-    --threshold "${threshold}" \
-    --gpu "${gpu}" \
-    --repo-root "${repo_root}" \
-    --output-root "${results_root}" >>"${log_path}" 2>&1
+  if [[ -f "${results_root}/${tag}/generation_times.csv" ]]; then
+    completed=$(awk -F, 'NR > 1 && $1 == "ok" {count++} END {print count + 0}' \
+      "${results_root}/${tag}/generation_times.csv")
+  fi
+  if [[ "${completed}" -lt 20 ]]; then
+    echo "$(date -Is) resuming generation threshold=${threshold} gpu=${gpu} completed=${completed}/20" >>"${log_path}"
+    "${generation_python}" "${repo_root}/vbench1_minimal_v2_pack/run_threshold_ablation_generate.py" \
+      --threshold "${threshold}" \
+      --gpu "${gpu}" \
+      --repo-root "${repo_root}" \
+      --output-root "${results_root}" >>"${log_path}" 2>&1
+  else
+    echo "$(date -Is) generation already complete threshold=${threshold} (${completed}/20)" >>"${log_path}"
+  fi
 
   echo "$(date -Is) starting VBench threshold=${threshold} gpu=${gpu}" >>"${log_path}"
-  CUDA_VISIBLE_DEVICES="${gpu}" "${evaluation_python}" \
+  CUDA_VISIBLE_DEVICES="${gpu}" HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 "${evaluation_python}" \
     "${repo_root}/vbench1_minimal_v2_pack/eval_threshold_ablation.py" \
     --threshold "${threshold}" \
     --device cuda \
