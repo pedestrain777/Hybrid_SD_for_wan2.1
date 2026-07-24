@@ -19,7 +19,7 @@ class SwitchHarness:
     _update_dynamic_switch = HybridWanPipeline._update_dynamic_switch
 
 
-def make_pipe(threshold=0.20, min_step=2, max_step=4):
+def make_pipe(threshold=0.15, min_step=2, max_step=4):
     pipe = SwitchHarness()
     pipe.step_config = {
         "dynamic_switch": True,
@@ -54,7 +54,7 @@ def main():
         hybrid_dynamic_switch=True,
         hybrid_dynamic_switch_min_step=28,
         hybrid_dynamic_switch_max_step=38,
-        hybrid_dynamic_switch_threshold=0.20,
+        hybrid_dynamic_switch_threshold=0.15,
         hybrid_dynamic_switch_patience=2,
     )
     runner = HybridVideoInferencePipeline(["/large", "/small"], 0, "cpu", args)

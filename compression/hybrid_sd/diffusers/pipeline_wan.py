@@ -324,7 +324,7 @@ class HybridWanPipeline(WanPipeline):
 
         min_step = int(self.step_config.get("dynamic_switch_min_step", 28))
         max_step = int(self.step_config.get("dynamic_switch_max_step", 38))
-        threshold = float(self.step_config.get("dynamic_switch_threshold", 0.20))
+        threshold = float(self.step_config.get("dynamic_switch_threshold", 0.15))
         patience = max(1, int(self.step_config.get("dynamic_switch_patience", 2)))
         recent = [row["x0_relative_rmse"] for row in self.dynamic_switch_trace[-patience:]]
         stable = (

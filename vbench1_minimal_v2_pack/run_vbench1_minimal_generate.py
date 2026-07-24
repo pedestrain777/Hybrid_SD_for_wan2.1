@@ -167,7 +167,7 @@ class Args:
         self.hybrid_dynamic_switch = config_name == "DYN28_38"
         self.hybrid_dynamic_switch_min_step = 28
         self.hybrid_dynamic_switch_max_step = 38
-        self.hybrid_dynamic_switch_threshold = 0.20
+        self.hybrid_dynamic_switch_threshold = 0.15
         self.hybrid_dynamic_switch_patience = 2
 
         self.hybrid_debug_every = debug_every

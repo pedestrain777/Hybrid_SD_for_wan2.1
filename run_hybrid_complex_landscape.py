@@ -144,7 +144,7 @@ def _parse_cli():
     parser.add_argument(
         "--switch-threshold",
         type=float,
-        default=float(os.environ.get("WAN_HYBRID_SWITCH_THRESHOLD", 0.20)),
+        default=float(os.environ.get("WAN_HYBRID_SWITCH_THRESHOLD", 0.15)),
         help="连续 clean-sample 相对 RMSE 的动态切换阈值。",
     )
     parser.add_argument(

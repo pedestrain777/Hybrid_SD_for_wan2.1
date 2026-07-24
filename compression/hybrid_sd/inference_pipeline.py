@@ -953,7 +953,7 @@ class HybridVideoInferencePipeline:
             "dynamic_switch_min_step": dynamic_min_step,
             "dynamic_switch_max_step": dynamic_max_step,
             "dynamic_switch_threshold": float(
-                getattr(args, "hybrid_dynamic_switch_threshold", 0.20)
+                getattr(args, "hybrid_dynamic_switch_threshold", 0.15)
             ),
             "dynamic_switch_patience": int(
                 getattr(args, "hybrid_dynamic_switch_patience", 2)

@@ -10,6 +10,7 @@ Research implementation of two-stage Wan2.1 14B/1.3B collaborative video generat
 4. Preserve full-video Wan RoPE coordinates and feather the large-model correction into the small-model prediction.
 
 The default spatial cue is the small-model CFG gap. Temporal routing uses adjacent latent-frame differences.
+The default dynamic-switch threshold is `0.15`, selected from a 20-prompt VBench-1.0 calibration sweep.
 
 ## Environment
 

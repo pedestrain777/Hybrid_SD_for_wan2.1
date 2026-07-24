@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Select the fastest threshold within 1% of the best calibration VBench mean."""
+"""Select a conservative threshold on the best quality/compute plateau."""
 
 import argparse
 import csv
@@ -72,7 +72,15 @@ def main():
     best_quality = max(row["calibration_vbench_mean"] for row in records)
     quality_floor = best_quality * (1.0 - args.quality_tolerance)
     eligible = [row for row in records if row["calibration_vbench_mean"] >= quality_floor]
-    selected = min(eligible, key=lambda row: row["mean_generation_sec"])
+    earliest_mean_switch = min(row["mean_switch_step"] for row in eligible)
+    compute_plateau = [
+        row for row in eligible
+        if abs(row["mean_switch_step"] - earliest_mean_switch) < 1e-9
+    ]
+    # Wall-clock measurements were collected across interrupted/resumed server periods.
+    # Use the actual model schedule as the compute proxy, then choose the smallest
+    # threshold on the tied plateau to avoid needless early switching on unseen prompts.
+    selected = min(compute_plateau, key=lambda row: row["threshold"])
     baseline_time = next(
         row["mean_generation_sec"] for row in records if row["threshold"] == THRESHOLDS[0]
     )
@@ -82,7 +90,7 @@ def main():
         row["eligible_within_1pct"] = row in eligible
 
     result = {
-        "selection_rule": "fastest threshold within 1% relative of the best seven-dimension calibration VBench mean",
+        "selection_rule": "among thresholds within 1% of best quality, choose the earliest mean switch; on a tied compute plateau choose the smallest threshold",
         "quality_tolerance": args.quality_tolerance,
         "best_quality": best_quality,
         "quality_floor": quality_floor,
@@ -95,16 +103,17 @@ def main():
     lines = [
         "# Dynamic Switch Threshold Ablation",
         "",
-        "Selection rule: choose the fastest threshold whose seven-dimension calibration VBench mean is within 1% relative of the best value.",
+        "Selection rule: retain thresholds within 1% of the best seven-dimension calibration VBench mean, choose the earliest mean switch, then choose the smallest threshold on a tied compute plateau.",
         "",
-        "| tau | VBench mean | quality drop | generation sec | speedup vs 0.10 | mean switch | eligible |",
-        "| ---: | ---: | ---: | ---: | ---: | ---: | :---: |",
+        "Raw wall-clock time is diagnostic only because generation was interrupted and resumed under different server loads.",
+        "",
+        "| tau | VBench mean | quality drop | mean switch | eligible |",
+        "| ---: | ---: | ---: | ---: | :---: |",
     ]
     for row in records:
         lines.append(
             f"| {row['threshold']:.2f} | {row['calibration_vbench_mean']:.4f} | "
-            f"{100 * row['relative_quality_drop']:.2f}% | {row['mean_generation_sec']:.1f} | "
-            f"{row['speedup_vs_tau_0p10']:.3f}x | {row['mean_switch_step']:.1f} | "
+            f"{100 * row['relative_quality_drop']:.2f}% | {row['mean_switch_step']:.1f} | "
             f"{'yes' if row['eligible_within_1pct'] else 'no'} |"
         )
     lines.extend(["", f"Selected threshold: **{selected['threshold']:.2f}**", ""])
